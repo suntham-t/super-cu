@@ -94,6 +94,12 @@ img 1728x1080 (screen 2560x1600) 86KB — 用 @n:0.42,0.31 归一化坐标指位
 
 `region:[x,y,w,h]` 只截一块（物理像素，按请求尺寸 1:1 返回；此时 `max_image_width` 不生效）。
 
+### 编号截图 `marks`（视觉兜底首选）
+
+`cu_show {"screenshot":true,"marks":true}`（或只给 `marks:true`，会自动截图）会在元素上画红框并写 `[id]`，文本末尾提示：
+`marks: 图中方框数字 = 元素 id，可直接用 #id 点击（已标 N 个）`。
+看到方框里的数字就**直接用 `#id` 操作**，不要换算坐标；只有画不出框的 canvas/自绘区域才退回 `@n:ux,uy`。默认关闭，普通文本观察不受影响。
+
 ## 5. 批量动作（cu_do）
 
 ```json
@@ -114,10 +120,31 @@ img 1728x1080 (screen 2560x1600) 86KB — 用 @n:0.42,0.31 归一化坐标指位
 
 ### 常用 op
 
-`click dblclick rightclick hover focus set type key paste scroll drag select invoke toggle expand collapse activate launch close minimize maximize wait assert`
+`click dblclick rightclick hover focus set type key paste scroll scroll_to drag select invoke toggle expand collapse activate launch close minimize maximize wait assert clipboard window_move`
 
 - 写入文本用 `set`（优先 UIA ValuePattern，后台不抢焦点）；输入框追加用 `type`；快捷键用 `key`。
-- 滚动用 `scroll` + `amount`（可负），别去点滚动条。
+- 滚动用 `scroll` + `amount`（可负），别去点滚动条；**把元素滚进视口用 `scroll_to` + target**（ScrollItemPattern，滚不动会显式报错，不会假装成功）。
+- `drag` 的 `to` 可直接写元素：`{"op":"drag","target":"#A","to":"#B"}` 或 `"to":"ct:名字"`，服务端取元素中心，不用自己算坐标。
+
+### 剪贴板：`clipboard` op（显式读写）
+
+```json
+{"op":"clipboard","mode":"set","text":"要放进剪贴板的内容"}
+{"op":"clipboard","mode":"get"}
+```
+
+- `set`：写剪贴板并回读校验；**会覆盖用户剪贴板**，只在确实需要搬运数据时用。
+- `get`：把剪贴板文本放进结果：`clipboard: "..."`（换行显示 `⏎`，超长截断 800 字符）。
+- `set` 缺文本 → `-32602`；读失败（被占用/非文本）→ 明确报错，不静默。
+- 往输入框粘文本仍然优先 `paste`（它有"写剪贴板→回读→SendKeys 兜底"的完整链路）。
+
+### 窗口几何：`window_move`
+
+```json
+{"op":"window_move","window":"#1234","x":100,"y":80,"w":1200,"h":800}
+```
+
+移动到物理像素位置（`w/h` 省略=保持；多屏坐标可为负；maximized 先还原）。比拖标题栏稳定，适合多显示器/固定布局任务。
 
 ### `paste`：剪贴板粘贴（必须给文本）
 
@@ -183,6 +210,22 @@ img 1728x1080 (screen 2560x1600) 86KB — 用 @n:0.42,0.31 归一化坐标指位
 3. 弹「保存此文件」时，文件名框只接受**纯文件名**；要换目录必须点「浏览」或左侧位置列表。
 
 判断自己在哪个对话框：`cu_show` 看标题/按钮——现代对话框有「更多选项…」，经典对话框有地址栏 + 文件名 + 保存类型。保存后用 `expect`/`wait_kind window` 确认新标题，或 `cu_show` 看标题是否还有 `*`。
+
+### 实战规则 A：Office 是 SDI 多窗口，先选窗口再操作
+
+Excel/Word/PowerPoint 每打开一个文档就是一个**独立顶层窗口**，同进程、标题高度相似（多个「工作簿1 - Excel」）。操作前：
+
+1. `cu_show {"scope":"desktop"}`；
+2. 找目标行：同 pid 多个窗口会标 `[同进程 xN]`，结尾有「可用 #hwnd 精确指定」提示；
+3. 后续所有步骤都带 `window:"#hwnd"`（或第一条 `cu_do` 里先 `activate` 该 `#hwnd`，之后省略 `window` 会沿用）。
+不要只靠标题子串选窗口——会把内容写进另一个工作簿。
+
+### 实战规则 B：Excel 定位精确区域用 Ctrl+G，保存用 F12
+
+- **不要**用 `set` 写 Excel 的「名称框（Name Box）」来跳转：它经常不接受 `set` 的 ValuePattern，写进去不生效或错位。正确做法：`key "^g"` 打开「定位」对话框 → `wait {"wait_kind":"window","text":"定位"}` → 在「引用位置」里 `set "B12"` 或区域 `A1:D20` → `enter`。
+- 选中区域后写值用 `paste`（多行/多列拆成 `\t`/`\n` 一次贴），别逐格点。
+- 保存用 `key "f12"`（另存为）或 `key "^s"`；F12 在部分版本被占用时回到 §7 主流程（更多选项→浏览）。
+- 改完用 `expect`/`cu_show` 确认单元格内容（`view=controls` 里 text 元素会显示值）。
 
 ## 8. 失败与重试规则
 

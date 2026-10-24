@@ -1,4 +1,4 @@
-﻿"""Offline mock of CONTRACT §3 (`windows.py` + `bridge.py`) — T2's stand-in.
+"""Offline mock of CONTRACT §3 (`windows.py` + `bridge.py`) — T2's stand-in.
 
 Used by ``python -u src/server.py --mock`` (or ``SUPER_CU_MOCK=1``) and by
 ``tests/test_server.py`` while T1's real bridge is still being written.  It is
@@ -107,7 +107,7 @@ def _explorer():
         _n("ex.new", "button", "新建", (410, 158, 480, 192), 2, ("invoke",),
            path="工具栏"),
         _n("ex.addr", "edit", "地址栏", (500, 158, 1200, 192), 2,
-           ("value", "setvalue"), val="C:\\Users\\demo\\Downloads", path="工具栏"),
+           ("value", "setvalue"), val="D:\\Users\\LENOVO\\Downloads", path="工具栏"),
         _n("ex.list", "list", "", (400, 200, 1400, 950), 1, kids=0),
         _n("ex.file1", "listitem", "super-cu-1.0.0.zip", (410, 210, 1390, 250), 2,
            ("selection", "invoke"), path=""),
@@ -135,7 +135,7 @@ def _terminal():
     return [
         _n("term.win", "window", "Windows PowerShell", (0, 0, 1280, 800), 0, kids=1),
         _n("term.doc", "document", "Windows PowerShell", (8, 40, 1272, 792), 1,
-           ("textpattern",), val="PS C:\\demo>", path=""),
+           ("textpattern",), val="PS D:\\opencode>", path=""),
     ]
 
 
@@ -251,6 +251,8 @@ class _State:
         self.shot = None
         self.launched = []
         self.missing = set()
+        self.clipboard = ""          # B8: clipboard op state
+        self.scroll_into = set()     # B8: (hwnd, rid) scrolled into view
 
     def id_for(self, rid):
         if rid not in self.ids:
@@ -347,6 +349,29 @@ def get_rect(hwnd):
     return list(_STATE.windows[hwnd]["rect"])
 
 
+def move_window(hwnd, x, y, w=None, h=None):
+    """Mock of windows.move_window: move/resize and return the new rect."""
+    hwnd = int(hwnd)
+    if hwnd not in _STATE.windows or hwnd in _STATE.missing:
+        raise BridgeError(f"窗口 {hwnd} 已关闭或不存在")
+    win = _STATE.windows[hwnd]
+    rect = win["rect"]
+    cw = int(w) if w else max(80, rect[2] - rect[0])
+    ch = int(h) if h else max(80, rect[3] - rect[1])
+    win["rect"] = [int(x), int(y), int(x) + cw, int(y) + ch]
+    win["minimized"] = False
+    return list(win["rect"])
+
+
+def get_clipboard_text(attempts=6):
+    return _STATE.clipboard
+
+
+def set_clipboard_text(text, attempts=6):
+    _STATE.clipboard = str(text or "")
+    return True
+
+
 def wait_for_window(query, timeout_ms):
     found = find_windows(query, limit=1)
     if found:
@@ -412,6 +437,8 @@ class Bridge:
             who = _STATE.focus.get((int(hwnd), node["_rid"]))
             if who:
                 node["focused"] = True
+            if (int(hwnd), node["_rid"]) in _STATE.scroll_into:
+                node["offscreen"] = False
         return nodes
 
     @staticmethod
@@ -574,6 +601,18 @@ class Bridge:
                     _STATE.foreground = 1002
             return done(True, "win32", f"{action} 完成", True)
 
+        if action == "scroll_to":
+            if target in (None, ""):
+                return done(False, "uia", "scroll_to 需要元素 target")
+            try:
+                public, _info = self.resolve(target, hwnd)
+            except BridgeError as exc:
+                return done(False, "uia", str(exc))
+            raw = _STATE.by_id.get(public.get("id"))
+            if raw is not None:
+                _STATE.scroll_into.add((int(hwnd), raw["_rid"]))
+            return done(True, "uia", f"已滚入视口 #{public['id']}", True)
+
         node = None
         if target not in (None, ""):
             try:
@@ -681,7 +720,8 @@ class Bridge:
                 "detail": detail or f'{kind} "{needle}" 已满足'}
 
     # -- screenshot -------------------------------------------------------- #
-    def screenshot(self, hwnd=None, *, region=None, max_width=1280, quality=70):
+    def screenshot(self, hwnd=None, *, region=None, max_width=1280, quality=70,
+                   marks=False):
         t0 = time.perf_counter()
         if region and len(region) >= 4:
             ox, oy, sw, sh = (int(region[0]), int(region[1]),
@@ -705,6 +745,7 @@ class Bridge:
                 "img_w": img_w, "img_h": img_h,
                 "screen_w": sw, "screen_h": sh,
                 "origin": [ox, oy], "scale": scale,
+                "marks_applied": False,
                 "ms": max(1, int((time.perf_counter() - t0) * 1000))}
         _STATE.shot = dict(shot)
         return shot

@@ -67,6 +67,9 @@ __all__ = [
     "HOLD_MAX_MS",
     "hold_keys",
     "hold_mouse",
+    "collect_marks",
+    "annotate_marks",
+    "clamp_expected_delta",
 ]
 
 
@@ -85,6 +88,7 @@ LOCK_ACTIONS = frozenset(
         "key",
         "hold",
         "hold_mouse",
+        "scroll_to",
         "paste",
         "scroll",
         "drag",
@@ -213,6 +217,34 @@ INTERACTIVE_TYPES = frozenset(
         "SplitButtonControl",
         "DocumentControl",
     }
+)
+
+#: 可交互类型的**短名**（Set-of-Mark 用；document 是整页内容，框住没意义）
+#: 出现在标题栏判定点下方即说明"这是内容"，不是窗口标题栏
+_CAPTION_BLOCK_CTS = frozenset(
+    {
+        "DocumentControl",
+        "EditControl",
+        "ListItemControl",
+        "TreeItemControl",
+        "TableControl",
+        "DataGridControl",
+        "TabItemControl",
+        "TabControl",
+        "ToolBarControl",
+        "MenuBarControl",
+        "ButtonControl",
+        "HyperlinkControl",
+        "SliderControl",
+        "ComboBoxControl",
+        "CheckBoxControl",
+        "RadioButtonControl",
+        "ScrollBarControl",
+    }
+)
+
+MARK_CTS = frozenset(
+    CT_SHORT[name] for name in INTERACTIVE_TYPES if name != "DocumentControl"
 )
 
 TEXT_TYPES = frozenset({"TextControl", "DocumentControl"})
@@ -817,6 +849,66 @@ def _rect_tuple(rect: Any) -> list[int]:
 
 def _area(r: list[int]) -> int:
     return max(0, r[2] - r[0]) * max(0, r[3] - r[1])
+
+
+_MARK_COLORS = [(255, 64, 64), (64, 160, 255), (46, 204, 113), (255, 176, 32)]
+
+
+def _clamp_int(v: int, lo: int, hi: int) -> int:
+    if hi < lo:
+        hi = lo
+    return max(int(lo), min(int(v), int(hi)))
+
+
+def collect_marks(nodes: list[dict], crop: tuple[int, int, int, int], *, limit: int = 120) -> list[dict]:
+    """Interactive nodes inside *crop* as Set-of-Mark entries (physical pixels).
+
+    Pure function (no COM / no PIL) so it can be unit-tested without a desktop.
+    """
+    l, t, r, b = crop
+    marks: list[dict] = []
+    for node in nodes or []:
+        if (node.get("ct") or "") not in MARK_CTS:
+            continue
+        try:
+            rect = [int(v) for v in (node.get("rect") or [0, 0, 0, 0])[:4]]
+        except Exception:
+            continue
+        if rect[2] - rect[0] <= 2 or rect[3] - rect[1] <= 2:
+            continue
+        il, it = max(rect[0], l), max(rect[1], t)
+        ir, ib = min(rect[2], r), min(rect[3], b)
+        if ir - il <= 2 or ib - it <= 2:
+            continue
+        marks.append({"id": node.get("id"), "rect": [il, it, ir, ib],
+                      "ct": node.get("ct"), "name": (node.get("name") or "")[:60]})
+        if limit and len(marks) >= int(limit):
+            break
+    return marks
+
+
+def annotate_marks(img, marks: list[dict], origin: list[int], scale: float):
+    """Draw numbered boxes for *marks* on a PIL image (pure, returns a new image)."""
+    from PIL import ImageDraw
+
+    base = img.convert("RGB")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    scale = scale or 1.0
+    for i, mark in enumerate(marks):
+        l = int(round((mark["rect"][0] - origin[0]) / scale))
+        t = int(round((mark["rect"][1] - origin[1]) / scale))
+        r = int(round((mark["rect"][2] - origin[0]) / scale))
+        b = int(round((mark["rect"][3] - origin[1]) / scale))
+        color = _MARK_COLORS[i % len(_MARK_COLORS)]
+        draw.rectangle([l, t, r, b], outline=color + (255,), width=2)
+        label = str(mark.get("id"))
+        tw = 7 * len(label) + 8
+        th = 14
+        ly = t - th if t - th >= 0 else t
+        draw.rectangle([l, ly, l + tw, ly + th], fill=color + (210,))
+        draw.text((l + 4, ly + 1), label, fill=(255, 255, 255, 255))
+    return Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
 
 
 def _norm(s: str) -> str:
@@ -1952,6 +2044,11 @@ class Bridge:
             note = f"（ms 已截断到 {used}）" if clipped else ""
             return "mouse", f"hold_mouse: {btn} {used}ms beats={info['beats']}{note}", True
 
+        if action == "scroll_to":
+            if ctl is None:
+                raise BridgeError("scroll_to 需要元素 target")
+            return self._scroll_into_view(ctl)
+
         if action == "scroll":
             return self._scroll(hwnd, el, resolved, amount)
 
@@ -2228,6 +2325,114 @@ class Bridge:
             )
         return "sendkeys", f"剪贴板不可用，改用 SendKeys 分块输入 chunks={chunks}", True
 
+    def _scroll_into_view(self, ctl: Any) -> tuple[str, str, bool]:
+        """Scroll an element into view: ScrollItemPattern first, parent scroll after.
+
+        Degrades to an **explicit failure** when neither pattern exists — it never
+        pretends to have scrolled.
+        """
+        off_before = bool(_prop(ctl, "IsOffscreen", False))
+        pat = self._pattern(ctl, "GetScrollItemPattern")
+        if pat is not None:
+            try:
+                pat.ScrollIntoView()
+                time.sleep(0.15)
+                off_after = bool(_prop(ctl, "IsOffscreen", False))
+                return (
+                    "uia",
+                    f"ScrollItemPattern.ScrollIntoView（offscreen {off_before}→{off_after}）",
+                    off_before and not off_after,
+                )
+            except Exception:
+                pass
+        parent = ctl
+        parent_pat = None
+        for _ in range(4):
+            try:
+                parent = parent.GetParentControl()
+            except Exception:
+                parent = None
+            if parent is None:
+                break
+            parent_pat = self._pattern(parent, "GetScrollPattern")
+            if parent_pat is not None:
+                break
+        if parent_pat is None:
+            raise BridgeError(
+                "该元素不支持 ScrollIntoView，父容器也没有 ScrollPattern"
+                "（ScrollItemPattern/ScrollPattern 都不可用），无法滚动到视口"
+            )
+        plain = auto.ScrollAmount.NoAmount
+        step = auto.ScrollAmount.SmallIncrement
+        try:
+            for _ in range(6):
+                parent_pat.Scroll(plain, step)
+                time.sleep(0.08)
+                if not _prop(ctl, "IsOffscreen", True):
+                    return "uia", "父容器 ScrollPattern 滚动后已进入视口", True
+        except Exception as exc:
+            raise BridgeError(f"父容器滚动失败：{type(exc).__name__}: {exc}") from exc
+        raise BridgeError(
+            "ScrollIntoView 不可用，父容器滚动 6 次后元素仍不可见（该控件不支持滚动到视口）"
+        )
+
+    def _point_or_element(self, spec: str, hwnd: int) -> tuple[int, int]:
+        """拖放终点：@x,y / @n: / @img: 或元素目标（#id / ct:name）。"""
+        s = (spec or "").strip()
+        if not s:
+            raise BridgeError("拖放终点为空")
+        m = re.match(r"^([A-Za-z]+):", s)
+        is_selector = s.startswith("#") or bool(m and m.group(1).lower() in SHORT_CT)
+        if not is_selector:
+            return self._point_from_spec(s)
+        el, _meta = self.resolve(s, hwnd)
+        rect = _rect_tuple(_prop(el.control, "BoundingRectangle", None))
+        if _area(rect) == 0:
+            rect = list(el.node.get("rect") or [0, 0, 0, 0])
+        if _area(rect) == 0:
+            raise BridgeError(f"拖放终点 {s!r} 没有可见矩形（offscreen），无法作为落点")
+        return (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
+
+    # -- clipboard --------------------------------------------------------- #
+    def clipboard_get(self) -> str | None:
+        """Current clipboard text (None = no text / unreadable)."""
+        return _win.get_clipboard_text()
+
+    def clipboard_set(self, text: str, *, verify: bool = True) -> bool:
+        """Write CF_UNICODETEXT with retries + read-back; ClipboardBusy on failure."""
+        text = text or ""
+        ok = _clipboard_write_verified(text) if verify else _win.set_clipboard_text(text)
+        if not ok:
+            raise ClipboardBusy(
+                "剪贴板被其他程序占用（OpenClipboard 重试 3 次失败或回读不一致）"
+            )
+        return True
+
+    # -- window geometry --------------------------------------------------- #
+    def window_move(
+        self, hwnd: int, x: int, y: int, w: int | None = None, h: int | None = None
+    ) -> list[int]:
+        """Move/resize (clamped to the virtual screen); returns the new rect."""
+        hwnd = int(hwnd)
+        if not _win.is_window(hwnd):
+            raise BridgeError(f"窗口 #{hwnd} 已关闭，无法移动")
+        with self._locked():
+            rect = _win.move_window(hwnd, x, y, w, h)
+        self._drop_window(hwnd)  # 位置变了，缓存 rect 已过期
+        return rect
+
+    def _nodes_for_marks(self, hwnd: int | None) -> list[dict]:
+        """Nodes for Set-of-Mark: fresh snapshot cache, else one snapshot."""
+        if not hwnd:
+            return []
+        cache = self._cache.get(int(hwnd))
+        if cache and (time.monotonic() - float(cache.get("ts") or 0)) < 2.0:
+            return list(cache.get("nodes") or [])
+        try:
+            return list(self.snapshot(int(hwnd), view="controls", max_nodes=300)["nodes"])
+        except BridgeError:
+            return []
+
     def _scroll(
         self, hwnd: int, el: Element | None, resolved: dict, amount: int
     ) -> tuple[str, str, bool]:
@@ -2275,7 +2480,7 @@ class Bridge:
         """
         if not to:
             raise BridgeError("drag 需要 to 目标坐标")
-        tx, ty = self._point_from_spec(to)
+        tx, ty = self._point_or_element(to, hwnd)
         if resolved.get("via") == "point":
             x, y = resolved["point"]
         elif el is not None:
@@ -2324,30 +2529,88 @@ class Bridge:
         _mouse("left", False)
         time.sleep(0.08)
         detail = f"拖动 ({x},{y}) -> ({tx},{ty})" + locals().get("detail_hold", "")
+        if not caption:
+            # 内容拖动（选文本/滚动条/拖放/拖进输入框）：窗口本就不该跟动，只报事实
+            detail += " drag content"
         if restored:
             detail += " 已先还原最大化窗口"
         if caption and win_before is not None:
             win_after = _win.get_rect(hwnd)
             wdx, wdy = win_after[0] - win_before[0], win_after[1] - win_before[1]
             cdx, cdy = tx - x, ty - y
-            detail += f" window_delta=({wdx},{wdy})"
-            if abs(cdx - wdx) > 5 or abs(cdy - wdy) > 5:
+            # 期望位移必须先按"屏幕夹取"算：窗口贴着虚拟屏边缘时，Windows 会把
+            # 那一轴夹住（合法 0 位移），拿未夹取的原始 delta 比会误判。
+            try:
+                vx, vy, vw, vh = _win.virtual_screen()
+                win_w = win_before[2] - win_before[0]
+                win_h = win_before[3] - win_before[1]
+                exp_dx = _clamp_int(win_before[0] + cdx, vx, vx + vw - win_w) - win_before[0]
+                exp_dy = _clamp_int(win_before[1] + cdy, vy, vy + vh - win_h) - win_before[1]
+            except Exception:
+                exp_dx, exp_dy = cdx, cdy
+            detail += f" window_delta=({wdx},{wdy}) exp_wdelta=({exp_dx},{exp_dy})"
+
+            def _axis_ok(actual: int, expected: int, raw: int) -> bool:
+                # 夹取时 expected 才是对的；没夹取时 raw 也对（OS 允许窗口越界）
+                return abs(actual - expected) <= 5 or abs(actual - raw) <= 5
+
+            if not (_axis_ok(wdx, exp_dx, cdx) and _axis_ok(wdy, exp_dy, cdy)):
                 raise BridgeError(
-                    f"{detail}；但窗口位移与光标位移 ({cdx},{cdy}) 不符"
-                    f"（起点可能不在可拖动区域，或窗口贴边/被应用限制），拖动没有生效"
+                    f"{detail}；但窗口位移 ({wdx},{wdy}) 与期望 ({exp_dx},{exp_dy}) /"
+                    f"光标位移 ({cdx},{cdy}) 都不符"
+                    f"（起点可能不在可拖动区域，或窗口被应用限制），拖动没有生效"
                 )
         return "click", detail, True
 
     @staticmethod
     def _looks_like_caption(hwnd: int, x: int, y: int) -> bool:
-        """Heuristic: is (x,y) inside the window's own title-bar band?"""
+        """Is (x,y) on the *title bar* (the only place a window should follow)?
+
+        Two gates, because the window-delta check is strict and must not fire for
+        content drags (selecting text, dragging a scrollbar, dropping a file):
+
+        1. geometry: inside the non-client caption band (``caption_height``);
+           borderless windows (Chromium) get a small 24px band instead of a
+           height-proportional one;
+        2. content probe: the UIA element under the point must not be page/editor
+           content (document, edit, list, tab, toolbar…); only the window itself
+           or a titlebar element counts as a caption.
+        """
         if not hwnd or not _win.is_window(hwnd):
             return False
         rect = _win.get_rect(hwnd)
         if not (rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]):
             return False
-        band = max(28, min(72, int((rect[3] - rect[1]) * 0.12)))
-        return y <= rect[1] + band
+        try:
+            cap_h = int(_win.caption_height(hwnd))
+        except Exception:
+            cap_h = 0
+        if _win.is_maximized(hwnd):
+            band = max(24, min(72, cap_h + 8))
+        elif cap_h > 0:
+            band = min(72, cap_h)
+        else:
+            band = 24  # 自绘标题栏：保守给一小条
+        if not (0 <= y - rect[1] <= band):
+            return False
+        # 二次保护：点在内容元素上就不算标题栏
+        try:
+            ctl = auto.ControlFromPoint(int(x), int(y))
+        except Exception:
+            return True
+        for _ in range(6):
+            if ctl is None:
+                return True
+            ct = _prop(ctl, "ControlTypeName", "") or ""
+            if ct in ("WindowControl", "TitleBarControl"):
+                return True
+            if ct in _CAPTION_BLOCK_CTS:
+                return False
+            try:
+                ctl = ctl.GetParentControl()
+            except Exception:
+                return True
+        return True
 
     # -- screenshot -------------------------------------------------------- #
     def screenshot(
@@ -2357,6 +2620,8 @@ class Bridge:
         region: list[int] | None = None,
         max_width: int = 1280,
         quality: int = 70,
+        marks: bool = False,
+        marks_max: int = 120,
     ) -> dict:
         t0 = time.perf_counter()
         self.space_check()
@@ -2403,10 +2668,16 @@ class Bridge:
         if max_width and img.width > int(max_width):
             ratio = int(max_width) / img.width
             img = img.resize((int(max_width), max(1, int(round(img.height * ratio)))), Image.BILINEAR)
+        scale = (screen_w / img.width) if img.width else 1.0
+        mark_list: list[dict] = []
+        if marks:
+            crop = (origin[0], origin[1], origin[0] + screen_w, origin[1] + screen_h)
+            mark_list = collect_marks(self._nodes_for_marks(hwnd), crop, limit=int(marks_max))
+            if mark_list:
+                img = annotate_marks(img, mark_list, origin, scale)
         buf = io.BytesIO()
         img.save(buf, "JPEG", quality=int(quality), optimize=False, progressive=False)
         data = buf.getvalue()
-        scale = (screen_w / img.width) if img.width else 1.0
         shot = {
             "mime": "image/jpeg",
             "jpeg_bytes": data,
@@ -2420,6 +2691,8 @@ class Bridge:
             "space": "physical",
             "ms": 0,
         }
+        if marks:
+            shot["marks"] = mark_list
         self._last_shot = shot
         shot["ms"] = int(round((time.perf_counter() - t0) * 1000))
         return shot

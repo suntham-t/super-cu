@@ -723,8 +723,25 @@ def format_snapshot(snap: dict, *, view: str = "controls", filter: str | None = 
 
 def format_windows(windows: list, *, limit: int = 12, elapsed_ms: int = 0,
                    max_chars: int = MAX_TEXT) -> str:
-    """Render ``scope=desktop``: the top N windows, ``#hwnd`` selectable."""
+    """Render ``scope=desktop``: the top N windows, ``#hwnd`` selectable.
+
+    Office (Excel/Word) is SDI: several visible windows can belong to one
+    process and share a title prefix, so same-pid windows are marked with
+    ``[同进程 xN]`` plus a one-line hint to pick one by ``#hwnd``.
+    """
     wins = [w for w in (windows or []) if isinstance(w, dict)]
+    pid_counts: dict = {}
+    for win in wins:
+        if win.get("visible", True) is False:
+            continue
+        pid = win.get("pid")
+        if pid is not None:
+            pid_counts[pid] = pid_counts.get(pid, 0) + 1
+    multi_pids = {pid for pid, count in pid_counts.items() if count > 1}
+    procs = {}
+    for win in wins:
+        if win.get("pid") in multi_pids:
+            procs.setdefault(win.get("pid"), win.get("proc") or "?")
     head = f"desktop {len(wins)} windows {int(elapsed_ms or 0)}ms"
     lines = [head]
     for win in wins[: max(1, int(limit or 12))]:
@@ -739,9 +756,16 @@ def format_windows(windows: list, *, limit: int = 12, elapsed_ms: int = 0,
             parts.append("[focus]")
         if win.get("minimized"):
             parts.append("min")
+        pid = win.get("pid")
+        if pid in multi_pids:
+            parts.append(f"[同进程 x{pid_counts[pid]}]")
         lines.append(" ".join(parts))
     if len(wins) > limit:
         lines.append(f"…(+{len(wins) - limit} more windows)")
+    if multi_pids:
+        apps = "、".join(f"{procs.get(pid, '?')}(pid {pid}, x{pid_counts[pid]})"
+                         for pid in sorted(multi_pids, key=lambda p: -pid_counts[p])[:3])
+        lines.append(f"提示：{apps} 同进程有多个窗口，可用 #hwnd 精确指定，别只按标题")
     return _fit([], lines, max_chars)
 
 

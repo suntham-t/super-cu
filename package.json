@@ -1,10 +1,18 @@
-﻿{
+{
   "name": "dsh-super-cu",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "DSH bundle for Windows desktop control over UI Automation: compact semantic snapshots with stable element ids (cu_show) and batched mouse, keyboard, window and wait/assert actions (cu_do).",
-  "keywords": ["dsh", "deepseek-harness", "computer-use", "ui-automation", "windows", "agent", "mcp"],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "computer-use",
+    "ui-automation",
+    "windows",
+    "agent",
+    "mcp"
+  ],
   "icon": "./icon.svg",
   "exports": {
     "./package.json": "./package.json",
@@ -18,7 +26,10 @@
     "icon.svg",
     "README.md",
     "SKILL.md",
-    "setup.ps1"
+    "setup.ps1",
+    "CHANGELOG.md",
+    "docs/RESEARCH.md",
+    "tests/test_server.py"
   ],
   "dsh": {
     "bundle": {

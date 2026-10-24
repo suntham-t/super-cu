@@ -1,4 +1,4 @@
-﻿# Submit dsh-super-cu to the awesome-dsh-plugin index (the list the DSH plugin
+# Submit dsh-super-cu to the awesome-dsh-plugin index (the list the DSH plugin
 # market reads from), without cloning the 200 MB index repository.
 #
 #   ./submit-to-market.ps1 -DryRun     # show what would be uploaded / created

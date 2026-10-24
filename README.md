@@ -77,12 +77,25 @@ op 一览：
 
 | 类别 | op |
 |---|---|
-| 鼠标 | `click` `dblclick` `rightclick` `hover` `drag`（可 `hold_ms`）`scroll` |
+| 鼠标 | `click` `dblclick` `rightclick` `hover` `drag`（可 `hold_ms`，`to` 支持 `#id` 拖到元素上）`scroll` `scroll_to` |
 | 键盘 | `key` `type` `paste` `hold`（按住 N ms） |
 | 鼠标按住 | `hold_mouse`（`left/right/middle`，按住期间 100 ms 心跳） |
 | UIA | `invoke` `toggle` `select` `expand` `collapse` `focus` `set` |
-| 窗口 | `activate` `launch` `close` `minimize` `maximize` |
+| 窗口 | `activate` `launch` `close` `minimize` `maximize` `window_move`（`x,y[,w,h]`） |
+| 系统 | `clipboard`（`mode: get｜set`） |
 | 控制 | `wait`（`wait_kind`: text/element/window/idle/change/gone） `assert` |
+
+### 1.1 新增（全部 opt-in，默认行为不变）
+
+- **`cu_show {"marks": true}`** — Set-of-Mark 截图：给每个可交互元素画编号方框（编号就是 `#id`），
+  模型"看得到"也能"点得准"。不加这个参数时返回体与 1.0 **逐字节一致**。
+- **`clipboard`** — 读/写剪贴板（写入后回读校验，用完恢复用户原剪贴板）。
+- **`window_move`** — 把窗口挪开/改大小（被别的窗口挡住时特别有用），越界自动 clamp。
+- **`scroll_to`** — 把元素滚进视口（`ScrollItemPattern` 优先 → 父容器有界滚动 → 明确失败）。
+- **`drag.to` 支持 `#id` / `ct:名字`** — 拖到目标元素中心（拖文件进聊天、拖卡片到目标）。
+- **`scope=desktop` 同进程提示** — 同一进程的多个窗口标 `[同进程 xN]`（Office 的 SDI 多窗口由此暴露）。
+- 依据见 [`docs/RESEARCH.md`](docs/RESEARCH.md)：对比 Windows-MCP / OmniParser / computer-use 规范后，
+  采纳了 5 条"不引入视觉模型、不扩权限面"的交互原语，并明确拒绝了 5 条（会拖慢或越权的）。
 
 ## 安装
 

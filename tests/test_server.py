@@ -515,6 +515,97 @@ def test_protocol():
         check("paste accepts value= alias", not is_error(paste_alias),
               text_of(paste_alias).splitlines()[0][:90])
 
+        # -- B8: marks / clipboard / window_move / scroll_to / drag selector -- #
+        listing2 = session.send("tools/list")
+        tools2 = {tool["name"]: tool for tool in
+                  (listing2.get("result") or {}).get("tools") or []}
+        show_props = tools2["cu_show"]["inputSchema"]["properties"]
+        check("cu_show schema adds marks (default false)",
+              show_props.get("marks", {}).get("default") is False,
+              str(show_props.get("marks")))
+        step_schema = tools2["cu_do"]["inputSchema"]["properties"]["steps"]["items"]
+        op_enum2 = step_schema["properties"]["op"]["enum"]
+        check("cu_do schema adds clipboard/window_move/scroll_to",
+              {"clipboard", "window_move", "scroll_to"} <= set(op_enum2),
+              str(sorted(set(op_enum2))))
+        step_props2 = step_schema["properties"]
+        check("step schema adds mode/x/y/w/h",
+              {"mode", "x", "y", "w", "h"} <= set(step_props2),
+              str(sorted(step_props2)))
+
+        marked = session.call("cu_show", {"window": "#1004", "marks": True})
+        marked_blocks = (marked.get("result") or {}).get("content") or []
+        marked_text = text_of(marked)
+        check("cu_show marks attaches an image",
+              any(block.get("type") == "image" for block in marked_blocks))
+        check("cu_show marks explains id boxes",
+              "图中方框数字" in marked_text and "已标" in marked_text,
+              marked_text.splitlines()[-1][:100])
+        plain_show = session.call("cu_show", {"window": "#1004"})
+        check("marks is opt-in (default output unchanged)",
+              "图中方框数字" not in text_of(plain_show)
+              and not any(block.get("type") == "image"
+                          for block in (plain_show.get("result") or {}).get("content") or []))
+
+        clip_set = session.call("cu_do", {"steps": [
+            {"op": "clipboard", "mode": "set", "text": "supercu-clip-测试"}]})
+        check("clipboard set ok", not is_error(clip_set)
+              and "1 ok clipboard" in text_of(clip_set),
+              text_of(clip_set).splitlines()[0][:90])
+        clip_get = session.call("cu_do", {"steps": [
+            {"op": "clipboard", "mode": "get"}]})
+        check("clipboard get returns the text in result",
+              'clipboard: "supercu-clip-测试"' in text_of(clip_get),
+              text_of(clip_get)[:140])
+        clip_missing = session.call("cu_do", {"steps": [
+            {"op": "clipboard", "mode": "set"}]})
+        check("clipboard set without text -> -32602",
+              (clip_missing.get("error") or {}).get("code") == -32602,
+              str(clip_missing.get("error"))[:90])
+        clip_bad_mode = session.call("cu_do", {"steps": [
+            {"op": "clipboard", "mode": "copy"}]})
+        check("clipboard bad mode -> -32602",
+              (clip_bad_mode.get("error") or {}).get("code") == -32602,
+              str(clip_bad_mode.get("error"))[:90])
+
+        moved = session.call("cu_do", {"steps": [
+            {"op": "window_move", "window": "#1004",
+             "x": 200, "y": 150, "w": 800, "h": 600}]})
+        check("window_move ok", not is_error(moved)
+              and "1 ok window_move win32" in text_of(moved),
+              text_of(moved).splitlines()[0][:90])
+        moved_show = text_of(session.call("cu_show", {"window": "#1004"}))
+        check("window_move took effect (800x600 @200,150)",
+              "800x600 @200,150" in moved_show,
+              moved_show.splitlines()[0][:90])
+
+        explorer_text = text_of(session.call("cu_show", {"window": "#1004"}))
+        explorer_btn = find_id(explorer_text, "button", "新建")
+        if explorer_btn:
+            scrolled = session.call("cu_do", {"steps": [
+                {"op": "scroll_to", "target": f"#{explorer_btn}",
+                 "window": "#1004"}]})
+            check("scroll_to ok", not is_error(scrolled)
+                  and "1 ok scroll_to" in text_of(scrolled),
+                  text_of(scrolled).splitlines()[0][:90])
+            dragged = session.call("cu_do", {"steps": [
+                {"op": "drag", "target": f"#{explorer_btn}",
+                 "to": "edit:地址栏", "window": "#1004"}]})
+            check("drag.to accepts element selector",
+                  not is_error(dragged)
+                  and "1 ok drag" in text_of(dragged),
+                  text_of(dragged).splitlines()[0][:90])
+        scroll_missing = session.call("cu_do", {"steps": [
+            {"op": "scroll_to", "window": "#1004"}]})
+        check("scroll_to without target -> -32602",
+              (scroll_missing.get("error") or {}).get("code") == -32602,
+              str(scroll_missing.get("error"))[:90])
+
+        desktop_same = text_of(session.call("cu_show", {"scope": "desktop"}))
+        check("desktop multi-window hint is opt-in (mock pids unique)",
+              "同进程" not in desktop_same,
+              desktop_same.splitlines()[0])
+
         # -- P1-1: inline observe keeps the cu_show budget ------------------ #
         probe = session.call("cu_show", {"window": "#1007", "max_nodes": 20})
         probe_text = text_of(probe)
@@ -842,6 +933,23 @@ def test_compact():
     desk = compact.format_windows(windows, limit=12, elapsed_ms=9)
     check("desktop lists at most 12 windows", desk.count("窗口") == 12)
     check("desktop reports hidden windows", "more windows" in desk)
+
+    same_pid = [
+        {"hwnd": 7001, "pid": 777, "proc": "excel", "title": "Book1",
+         "rect": [0, 0, 800, 600], "visible": True},
+        {"hwnd": 7002, "pid": 777, "proc": "excel", "title": "Book2",
+         "rect": [0, 0, 800, 600], "visible": True},
+        {"hwnd": 7003, "pid": 888, "proc": "winword", "title": "Doc1",
+         "rect": [0, 0, 800, 600], "visible": True},
+    ]
+    desk_same = compact.format_windows(same_pid)
+    check("same-process windows are marked",
+          desk_same.count("[同进程 x2]") == 2, desk_same[:200])
+    check("same-process hint tells the model to use #hwnd",
+          "可用 #hwnd 精确指定" in desk_same, desk_same.splitlines()[-1][:120])
+    single_pid = compact.format_windows(same_pid[2:])
+    check("single-window app gets no same-process mark",
+          "同进程" not in single_pid)
 
     check("cap_text enforces hard limit",
           len(compact.cap_text("x" * 20000)) == compact.MAX_TEXT)

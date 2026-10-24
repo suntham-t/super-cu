@@ -1,7 +1,7 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """super-cu MCP server — hand-rolled stdio JSON-RPC 2.0 (no third-party deps).
 
-    python -u src/server.py [--mock]
+    python -u D:\\opencode\\plugins\\super-cu\\src\\server.py [--mock]
 
 Implements CONTRACT.md §4/§5:
 
@@ -59,9 +59,10 @@ MAX_MAX_NODES = 400
 NO_GUI_OPS = frozenset({"wait", "assert"})
 WAIT_KINDS = ("text", "element", "window", "idle", "change", "gone")
 OPS = ("click", "dblclick", "rightclick", "hover", "focus", "set", "type",
-       "key", "hold", "hold_mouse", "scroll", "drag", "select", "invoke",
-       "toggle", "expand", "collapse", "activate", "launch", "close",
-       "minimize", "maximize", "wait", "assert", "paste")
+       "key", "hold", "hold_mouse", "scroll", "scroll_to", "drag", "select",
+       "invoke", "toggle", "expand", "collapse", "activate", "launch", "close",
+       "minimize", "maximize", "wait", "assert", "paste", "clipboard",
+       "window_move")
 HOLD_MIN_MS = 20
 HOLD_MAX_MS = 10000
 MOUSE_BUTTONS = ("left", "right", "middle")
@@ -286,6 +287,8 @@ CU_SHOW = {
                           "description": "最多显示多少行（上限 400）；服务端会多取候选再按“可交互优先”挑这 N 行"},
             "screenshot": {"type": "boolean", "default": False,
                            "description": "附一张 JPEG；仅当文本不足以判断时用"},
+            "marks": {"type": "boolean", "default": False,
+                      "description": "截图时在元素上画方框并写 [id]（自动附带截图）；默认关闭"},
             "region": {"type": "array", "items": {"type": "integer"},
                        "description": "[x,y,w,h] 物理屏幕像素裁剪；给了 region 时按 region 原始像素输出（不缩放），max_image_width 不生效"},
             "max_image_width": {"type": "integer", "default": SHOT_MAX_LONG,
@@ -304,6 +307,8 @@ CU_DO = {
         "目标窗口不在前台会自动激活，无需单列 activate。"
         "发送/删除/支付等不可逆动作先用 expect 验证上一步结果。"
         "observe=auto 仅在有界面变化或失败时回传最新界面。"
+        "新增：clipboard(mode get|set)、window_move(x,y,w,h)、scroll_to(target)；"
+        "drag 的 to 可直接写 #id / ct:名字。"
     ),
     "inputSchema": {
         "type": "object",
@@ -328,7 +333,20 @@ CU_DO = {
                         "value": {"type": "string"},
                         "amount": {"type": "integer",
                                    "description": "scroll 的格数，可负"},
-                        "to": {"type": "string", "description": "drag 的目标位置"},
+                        "to": {"type": "string",
+                               "description": "drag 的目标位置：@x,y / @n:ux,uy，或 #id / ct:名字（拖到元素上）"},
+                        "mode": {"type": "string", "enum": ["get", "set"],
+                                 "description": "clipboard 的读写模式，默认 get"},
+                        "x": {"type": "integer",
+                              "description": "window_move 的目标左上角 x（物理像素）"},
+                        "y": {"type": "integer",
+                              "description": "window_move 的目标左上角 y（物理像素）"},
+                        "w": {"type": "integer",
+                              "description": "window_move 的目标宽度（省略=保持）"},
+                        "h": {"type": "integer",
+                              "description": "window_move 的目标高度（省略=保持）"},
+                        "kind": {"type": "string", "enum": list(WAIT_KINDS),
+                                 "description": "wait_kind 的别名（兼容旧写法）"},
                         "ms": {
                             "type": "integer",
                             "description": ("hold / hold_mouse 的按住时长（毫秒）。"
@@ -595,7 +613,14 @@ class SuperCuServer:
                      "screen_w": int(sw), "screen_h": int(sh), "hwnd": hwnd})
         return meta
 
-    def _screenshot(self, hwnd, region, max_long=SHOT_MAX_LONG):
+    def _screenshot(self, hwnd, region, max_long=SHOT_MAX_LONG, *,
+                    marks=False, nodes=None):
+        """Capture; when ``marks`` is on, overlay element id boxes (server-side).
+
+        The bridge is asked to draw marks first (future capability, pass-through);
+        if it doesn't support them we annotate the JPEG ourselves so the model
+        can map picture boxes to the stable ``#id`` targets.
+        """
         b = self._b()
         if region:
             # explicit region: honour the requested pixel box (callers assert
@@ -608,18 +633,93 @@ class SuperCuServer:
             except (TypeError, ValueError):
                 limit = SHOT_MAX_LONG
             shrink_limit = SHOT_MAX_LONG
+        marked = 0
         try:
-            shot = b.bridge.screenshot(hwnd, region=region, max_width=limit)
+            shot = b.bridge.screenshot(hwnd, region=region, max_width=limit,
+                                       marks=marks)
         except TypeError:
-            shot = b.bridge.screenshot(hwnd)
+            try:
+                shot = b.bridge.screenshot(hwnd, region=region, max_width=limit)
+            except TypeError:
+                shot = b.bridge.screenshot(hwnd)
         if not isinstance(shot, dict):
             raise ToolError("bridge.screenshot 返回非对象")
         if not (shot.get("jpeg_bytes") or shot.get("png_bytes")):
             raise ToolError("截图没有返回图像数据")
         shot = self._shrink(shot, shrink_limit)
+        if marks and not shot.get("marks_applied") and nodes:
+            shot, marked = self._annotate_shot(shot, nodes)
         meta = self._shot_meta(shot, hwnd)
         self.last_shot = meta
-        return meta
+        return meta, marked
+
+    def _annotate_shot(self, shot, nodes):
+        """Draw ``[id]`` labels on element rects (best-effort, Pillow)."""
+        try:
+            import io
+
+            from PIL import Image, ImageDraw, ImageFont
+        except Exception as exc:  # pragma: no cover
+            log(f"marks skipped (Pillow): {exc}")
+            return shot, 0
+        data = shot.get("jpeg_bytes") or shot.get("png_bytes")
+        origin = shot.get("origin") or [0, 0]
+        sw = int(shot.get("screen_w") or shot.get("img_w") or 1)
+        sh = int(shot.get("screen_h") or shot.get("img_h") or 1)
+        iw = int(shot.get("img_w") or 0)
+        ih = int(shot.get("img_h") or 0)
+        if not data or iw <= 0 or ih <= 0 or sw <= 0 or sh <= 0:
+            return shot, 0
+        try:
+            image = Image.open(io.BytesIO(data)).convert("RGB")
+            draw = ImageDraw.Draw(image)
+            font = ImageFont.load_default()
+            sx, sy = iw / float(sw), ih / float(sh)
+            drawn = 0
+            for node in nodes:
+                if drawn >= 120:
+                    break
+                rect = node.get("rect") or [0, 0, 0, 0]
+                if len(rect) < 4:
+                    continue
+                left, top, right, bottom = [int(v) for v in rect[:4]]
+                if right - left < 2 or bottom - top < 2:
+                    continue
+                x0 = int(round((left - origin[0]) * sx))
+                y0 = int(round((top - origin[1]) * sy))
+                x1 = int(round((right - origin[0]) * sx))
+                y1 = int(round((bottom - origin[1]) * sy))
+                if x1 <= 0 or y1 <= 0 or x0 >= iw or y0 >= ih:
+                    continue
+                x0, y0 = max(0, x0), max(0, y0)
+                x1, y1 = min(iw - 1, x1), min(ih - 1, y1)
+                if x1 - x0 < 2 or y1 - y0 < 2:
+                    continue
+                draw.rectangle([x0, y0, x1, y1], outline=(255, 64, 64), width=2)
+                label = str(node.get("id"))
+                try:
+                    box = draw.textbbox((0, 0), label, font=font)
+                    tw, th = box[2] - box[0], box[3] - box[1]
+                except Exception:
+                    tw, th = 6 * len(label), 10
+                draw.rectangle([x0, y0, x0 + tw + 4, y0 + th + 3],
+                               fill=(200, 32, 32))
+                draw.text((x0 + 2, y0 + 1), label, fill=(255, 255, 255),
+                          font=font)
+                drawn += 1
+            if not drawn:
+                return shot, 0
+            buf = io.BytesIO()
+            image.save(buf, "JPEG", quality=70)
+            out = dict(shot)
+            out["jpeg_bytes"] = buf.getvalue()
+            out.pop("png_bytes", None)
+            out["mime"] = "image/jpeg"
+            out["marks_applied"] = True
+            return out, drawn
+        except Exception as exc:  # pragma: no cover - never fail cu_show
+            log(f"marks annotate failed: {type(exc).__name__}: {exc}")
+            return shot, 0
 
     def _to_point_spec(self, spec):
         """Map @n:ux,uy / @img:x,y to a physical @x,y point (server-side)."""
@@ -665,11 +765,15 @@ class SuperCuServer:
         filt = _as_str(args, "filter")
         max_nodes = _as_int(args, "max_nodes", DEFAULT_MAX_NODES, 1, MAX_MAX_NODES)
         want_shot = _as_bool(args, "screenshot", False)
+        marks = _as_bool(args, "marks", False)
+        if marks:
+            want_shot = True   # marks only makes sense on an image
         region = _as_region(args.get("region"))
         max_img = _as_int(args, "max_image_width", SHOT_MAX_LONG, 200, 3000)
 
         started = time.perf_counter()
         hwnd = None
+        snap = None
         if scope == "desktop":
             try:
                 wins = b.windows.list_windows()
@@ -700,10 +804,19 @@ class SuperCuServer:
         image_blocks = []
         if want_shot:
             try:
-                shot = self._screenshot(hwnd, region, max_img)
+                shot, marked = self._screenshot(
+                    hwnd, region, max_img, marks=marks,
+                    nodes=(snap.get("nodes") if snap else None))
                 data = shot.get("jpeg_bytes") or shot.get("png_bytes")
                 mime = shot.get("mime") or "image/jpeg"
                 text += "\n" + compact.format_shot_note(shot, len(data))
+                if marks:
+                    if marked:
+                        text += (f"\nmarks: 图中方框数字 = 元素 id，可直接用 #id 点击"
+                                 f"（已标 {marked} 个）")
+                    else:
+                        text += ("\nmarks: 本次没有可标注的元素（desktop 作用域或"
+                                 "元素无矩形），坐标仍用 @n:ux,uy")
                 image_blocks.append({
                     "type": "image",
                     "data": base64.b64encode(data).decode("ascii"),
@@ -743,7 +856,7 @@ class SuperCuServer:
                     -32602,
                     f'steps[{idx}].op="{op}" 非法；可用：{", ".join(OPS)}')
             for key in ("target", "text", "keys", "value", "window", "app",
-                        "expect", "to", "wait_kind", "kind"):
+                        "expect", "to", "wait_kind", "kind", "mode"):
                 if step.get(key) is not None and not isinstance(step.get(key), str):
                     raise RpcError(-32602, f"steps[{idx}].{key} 必须是字符串")
             wait_kind = step.get("wait_kind") or step.get("kind")
@@ -758,6 +871,26 @@ class SuperCuServer:
                     f'steps[{idx}].op="paste" 必须给 text 或 value'
                     f"（要写入剪贴板并粘贴的文本）；没文本时不要盲发 Ctrl+V，"
                     f"改用 op=key 或 op=type")
+            if op == "clipboard":
+                mode = step.get("mode") or "get"
+                if mode not in ("get", "set"):
+                    raise RpcError(-32602,
+                                   f'steps[{idx}].mode 只能是 "get" 或 "set"')
+                if mode == "set" and not (step.get("text") or step.get("value")):
+                    raise RpcError(
+                        -32602,
+                        f'steps[{idx}].op="clipboard" mode="set" 必须给 text'
+                        f"（要写入剪贴板的文本）")
+            if op == "window_move":
+                for axis in ("x", "y"):
+                    value = step.get(axis)
+                    if isinstance(value, bool) or not isinstance(value, int):
+                        raise RpcError(
+                            -32602,
+                            f"steps[{idx}].window_move 需要整数 {axis}（物理像素）")
+            if op == "scroll_to" and not step.get("target"):
+                raise RpcError(-32602,
+                               f'steps[{idx}].op="scroll_to" 必须给 target（#id / ct:名字）')
             if op in ("hold", "hold_mouse"):
                 v = step.get("ms")
                 if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
@@ -777,7 +910,7 @@ class SuperCuServer:
                     )
             if op == "hold_mouse" and step.get("button") is None:
                 pass  # 默认 left
-            for key in ("amount", "timeout_ms", "hold_ms"):
+            for key in ("amount", "timeout_ms", "hold_ms", "x", "y", "w", "h"):
                 value = step.get(key)
                 if value is not None and (isinstance(value, bool)
                                           or not isinstance(value, int)):
@@ -842,6 +975,10 @@ class SuperCuServer:
                     lines.append(compact.step_ok(idx, label,
                                                  res.get("via") or "-",
                                                  res.get("ms", 0), extra))
+                    if step["op"] == "clipboard" and res.get("content") is not None:
+                        content = res.get("content")
+                        lines.append('clipboard: "' +
+                                     compact.squeeze(content, 800) + '"')
                     if res.get("changed"):
                         last_changed = True
                         self.last_hwnd = last_hwnd or self.last_hwnd
@@ -883,8 +1020,8 @@ class SuperCuServer:
         image_blocks = []
         if want_shot:
             try:
-                shot = self._screenshot(last_hwnd or self.last_hwnd, None,
-                                        SHOT_MAX_LONG)
+                shot, _marked = self._screenshot(last_hwnd or self.last_hwnd,
+                                                 None, SHOT_MAX_LONG)
                 data = shot.get("jpeg_bytes") or shot.get("png_bytes")
                 text += "\n" + compact.format_shot_note(shot, len(data))
                 image_blocks.append({
@@ -908,6 +1045,11 @@ class SuperCuServer:
         b = self._b()
         op = step["op"]
         timeout = int(step.get("timeout_ms") or 3000)
+
+        if op == "clipboard":
+            return self._clipboard_step(step)
+        if op == "window_move":
+            return self._window_move_step(step)
 
         if op in NO_GUI_OPS:
             kind, value = _wait_kind(step)
@@ -941,7 +1083,8 @@ class SuperCuServer:
                     "detail": res.get("detail") or ("已满足" if ok else "超时未满足"),
                     "changed": False, "hwnd": hwnd}
 
-        activate = op not in ("launch", "close", "minimize", "maximize")
+        activate = op not in ("launch", "close", "minimize", "maximize",
+                              "scroll_to")
         if (op in ("key", "paste") and not step.get("window")
                 and not step.get("app")):
             # SendKeys targets whatever is focused — e.g. a save dialog opened
@@ -976,7 +1119,9 @@ class SuperCuServer:
             "timeout_ms": timeout,
         }
         if op == "drag":
-            kwargs["to"] = self._to_point_spec(step["to"]) if step.get("to") else None
+            to_spec = step.get("to")
+            kwargs["to"] = (self._resolve_to_target(to_spec, hwnd)
+                            if to_spec else None)
             kwargs["at"] = target
             kwargs["hold_ms"] = step.get("hold_ms")
         elif op in ("hold", "hold_mouse"):
@@ -1088,6 +1233,105 @@ class SuperCuServer:
             except Exception:
                 pass
         return None
+
+    # -- B8: clipboard / window_move / element-target helpers ---------------- #
+    def _action_lock(self, b, timeout_s=3.0):
+        """GUI lock for shared-desktop ops; mock never touches the real desktop."""
+        if b.kind == "mock":
+            return contextlib.nullcontext()
+        return gui_locked(timeout_s=timeout_s)
+
+    def _clipboard_step(self, step):
+        """B8 clipboard op: read/write the shared clipboard explicitly."""
+        b = self._b()
+        mode = (step.get("mode") or "get").strip().lower()
+        t0 = time.perf_counter()
+
+        def done(ok, detail, content=None):
+            return {"ok": ok, "via": "clipboard",
+                    "ms": max(1, int((time.perf_counter() - t0) * 1000)),
+                    "detail": detail, "changed": False, "content": content,
+                    "hwnd": self.last_hwnd}
+
+        if mode == "set":
+            text = step.get("text")
+            if text is None:
+                text = step.get("value") or ""
+            try:
+                with self._action_lock(b):
+                    ok = bool(b.windows.set_clipboard_text(text))
+            except GuiBusy as exc:
+                raise ToolError(
+                    f"剪贴板写入等锁超时：{exc}",
+                    advice="别的程序占着剪贴板/桌面，稍后重试；或改用 op=type")
+            except Exception as exc:
+                raise ToolError(
+                    f"写剪贴板失败：{type(exc).__name__}: {exc}",
+                    advice="剪贴板可能被占用：稍后重试，或用 op=type 直接输入")
+            return done(ok, (f"剪贴板已写入 {len(text)} 字符" if ok
+                             else "剪贴板写入失败（可能被其他程序占用）"))
+        try:
+            content = b.windows.get_clipboard_text()
+        except Exception as exc:
+            raise ToolError(
+                f"读剪贴板失败：{type(exc).__name__}: {exc}",
+                advice="剪贴板可能被占用：稍后重试；确认剪贴板里是文本")
+        if content is None:
+            return done(False, "剪贴板读取失败（被占用或内容不是文本）")
+        return done(True, f"已读取剪贴板 {len(content)} 字符", content)
+
+    def _window_move_step(self, step):
+        """B8 window_move op: move/resize the target window (physical pixels)."""
+        b = self._b()
+        hwnd = self._step_hwnd(step, activate=False)
+        x, y = int(step["x"]), int(step["y"])
+        w, h = step.get("w"), step.get("h")
+        t0 = time.perf_counter()
+        try:
+            with self._action_lock(b):
+                rect = b.windows.move_window(hwnd, x, y, w, h)
+        except GuiBusy as exc:
+            raise ToolError(f"移动窗口等锁超时：{exc}",
+                            advice="桌面被其他操作占用：稍后重试")
+        except Exception as exc:
+            raise ToolError(
+                f"移动窗口失败：{type(exc).__name__}: {exc}",
+                advice="确认窗口没有关闭、坐标在虚拟屏幕内（多屏可为负）")
+        rect = [int(v) for v in rect] if rect else []
+        detail = (f"窗口已移动到 {rect[0]},{rect[1]} "
+                  f"{rect[2] - rect[0]}x{rect[3] - rect[1]}" if len(rect) == 4
+                  else "窗口已移动")
+        return {"ok": True, "via": "win32",
+                "ms": max(1, int((time.perf_counter() - t0) * 1000)),
+                "detail": detail, "changed": True, "hwnd": hwnd}
+
+    def _resolve_to_target(self, spec, hwnd):
+        """drag.to: accept @coords OR an element selector (#id / ct:name)."""
+        if spec is None:
+            return None
+        s = self._to_point_spec(spec)
+        if s.startswith("@"):
+            return s
+        if s.startswith("#") or ":" in s:
+            b = self._b()
+            try:
+                element, info = b.bridge.resolve(s, hwnd)
+            except Exception as exc:
+                raise ToolError(
+                    f'drag.to="{s}" 无法解析：{exc}',
+                    advice="用 #id / ct:名字 / @x,y；歧义时用 #id")
+            node = info.get("node")
+            if not node:
+                node = element.get("node") if isinstance(element, dict) else getattr(
+                    element, "node", None)
+            rect = (node or {}).get("rect")
+            if not rect or len(rect) < 4 or rect[2] <= rect[0] or rect[3] <= rect[1]:
+                raise ToolError(f'drag.to="{s}" 没有可见矩形，拒绝盲拖',
+                                advice="先 cu_show 确认该元素可见，或改用 @x,y")
+            cx = (int(rect[0]) + int(rect[2])) // 2
+            cy = (int(rect[1]) + int(rect[3])) // 2
+            return f"@{cx},{cy}"
+        return s
 
     def _step_hwnd(self, step, *, activate):
         b = self._b()

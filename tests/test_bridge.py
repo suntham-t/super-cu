@@ -1224,6 +1224,373 @@ def t_hold_act_plumbing() -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
+# 13. 增量能力单测（全部不碰桌面）：Set-of-Mark / clipboard op / window_move /
+#     drag 元素落点 / scroll_to
+# --------------------------------------------------------------------------- #
+class _FakeScrollPattern:
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.calls = 0
+
+    def Scroll(self, a, b):
+        self.calls += 1
+        if not self.ok:
+            raise RuntimeError("scroll failed")
+
+    def ScrollIntoView(self):
+        self.calls += 1
+        if not self.ok:
+            raise RuntimeError("scroll into view failed")
+
+
+class _FakeScrollCtl:
+    def __init__(self, item=None, parent=None, offscreen=False):
+        self._item = item
+        self._parent = parent
+        self.IsOffscreen = offscreen
+
+    def GetScrollItemPattern(self):
+        if self._item is None:
+            raise Exception("no item pattern")
+        return self._item
+
+    def GetScrollPattern(self):
+        if self._parent is None:
+            raise Exception("no scroll pattern")
+        return self._parent
+
+    def GetParentControl(self):
+        return self._parent_ctl if hasattr(self, "_parent_ctl") else None
+
+
+def t_marks_collect() -> str:
+    nodes = [
+        {"id": 1, "ct": "button", "name": "保存", "rect": [10, 10, 60, 30]},
+        {"id": 2, "ct": "edit", "name": "搜索", "rect": [70, 10, 200, 30]},
+        {"id": 3, "ct": "text", "name": "标签", "rect": [10, 40, 100, 60]},      # 非交互
+        {"id": 4, "ct": "button", "name": "被裁掉", "rect": [900, 900, 950, 920]},  # 出界
+        {"id": 5, "ct": "button", "name": "零面积", "rect": [10, 70, 10, 90]},     # 无面积
+        {"id": 6, "ct": "document", "name": "整页", "rect": [0, 0, 800, 600]},     # document 不标
+        {"id": 7, "ct": "tabitem", "name": "标签页", "rect": [0, 0, 100, 200]},    # 部分裁切
+    ]
+    marks = B.collect_marks(nodes, (0, 0, 400, 400))
+    ids = [m["id"] for m in marks]
+    assert ids == [1, 2, 7], f"筛选/顺序不对: {ids}"
+    assert marks[0] == {"id": 1, "rect": [10, 10, 60, 30], "ct": "button", "name": "保存"}, marks[0]
+    marks2 = B.collect_marks(nodes, (0, 150, 400, 400))
+    assert [m["id"] for m in marks2] == [7] and marks2[0]["rect"] == [0, 150, 100, 200], marks2
+    assert B.collect_marks(nodes, (0, 0, 400, 400), limit=2)[-1]["id"] == 2
+    assert set(marks[0]) == {"id", "rect", "ct", "name"}, "mark 字段必须恰好是契约中的四个"
+    return f"{len(nodes)} 节点 → {len(marks)} 个标注（过滤 text/document/零面积/出界），裁剪与 limit 正确"
+
+
+def t_marks_annotate() -> str:
+    from PIL import Image as _Image
+
+    img = _Image.new("RGB", (200, 120), (255, 255, 255))
+    origin, scale = [0, 0], 2.0
+    marks = [{"id": 320, "rect": [100, 100, 200, 140], "ct": "button", "name": "保存"}]
+    out = B.annotate_marks(img, marks, origin, scale)
+    assert out.size == img.size and out.mode == "RGB"
+    # rect/scale → 图上 (50,50)-(100,70)；边框必须是彩色，内部仍接近白
+    box_px = out.getpixel((50, 60))
+    inside = out.getpixel((75, 60))
+    corner = out.getpixel((2, 2))
+    assert sum(box_px) < 720, f"标注边框没画上: {box_px}"
+    assert sum(corner) > 720, f"未标注区域被污染: {corner}"
+    assert sum(inside) > 600, f"框内被涂满（应只描边）: {inside}"
+    # 不同 origin 时换算也要对
+    out2 = B.annotate_marks(img, marks, [100, 100], 2.0)
+    assert sum(out2.getpixel((2, 2))) < 720, "origin 换算错误（应为左上角框）"
+    return f"PIL 标注：rect[100,100,200,140] scale=2 → 图上 (50,50)-(100,70)，边框着色、内部保留"
+
+
+def t_clipboard_api() -> str:
+    orig_set, orig_get = W.set_clipboard_text, W.get_clipboard_text
+    try:
+        W.set_clipboard_text = lambda text, attempts=6: True
+        W.get_clipboard_text = lambda attempts=6: "hello"
+        assert b.clipboard_get() == "hello"
+        assert b.clipboard_set("hello") is True
+        W.set_clipboard_text = lambda text, attempts=6: False
+        try:
+            b.clipboard_set("nope")
+            raise AssertionError("写入失败却没抛 ClipboardBusy")
+        except B.ClipboardBusy as exc:
+            assert "占用" in str(exc), str(exc)
+        W.set_clipboard_text = lambda text, attempts=6: True
+        W.get_clipboard_text = lambda attempts=6: "别的值"
+        try:
+            b.clipboard_set("want")
+            raise AssertionError("回读不一致却没抛 ClipboardBusy")
+        except B.ClipboardBusy:
+            pass
+    finally:
+        W.set_clipboard_text, W.get_clipboard_text = orig_set, orig_get
+    return "clipboard_get/set 正常；写入失败 & 回读不一致都抛 ClipboardBusy"
+
+
+def t_window_move_clamp() -> str:
+    # 纯函数：负坐标 / 超大尺寸都夹回虚拟屏
+    vx, vy, vw, vh = W.virtual_screen()
+    nx, ny, nw, nh = W.clamp_move(-99999, 99999, 99999, 99999, vx, vy, vw, vh)
+    assert nx == vx and ny == vy + vh - nh, (nx, ny)
+    assert nw <= vw and nh <= vh and nw >= 80 and nh >= 80, (nw, nh)
+    nx2, ny2, nw2, nh2 = W.clamp_move(vx + 10, vy + 20, 640, 480, vx, vy, vw, vh)
+    assert (nx2, ny2, nw2, nh2) == (vx + 10, vy + 20, 640, 480)
+    # bridge.window_move：透传 + 返回 rect；窗口不存在必须明确失败
+    calls = {}
+    orig = (W.is_window, W.move_window)
+    W.is_window = lambda h: True
+    W.move_window = lambda h, x, y, w, hh: (calls.update(h=h, x=x, y=y, w=w, hh=hh),
+                                            [x, y, x + (w or 0), y + (hh or 0)])[1]
+    try:
+        rect = b.window_move(4242, 33, 44, 300, 200)
+        assert rect == [33, 44, 333, 244], rect
+        assert calls == {"h": 4242, "x": 33, "y": 44, "w": 300, "hh": 200}, calls
+    finally:
+        W.is_window, W.move_window = orig
+    try:
+        b.window_move(123456789, 0, 0)
+        raise AssertionError("不存在的窗口没有报错")
+    except B.BridgeError as exc:
+        assert "已关闭" in str(exc), str(exc)
+    return f"clamp_move(-99999,99999,99999,99999) → ({nx},{ny},{nw},{nh})；window_move 透传并返回新 rect"
+
+
+def t_drag_to_element() -> str:
+    store = {"rect": [100, 100, 200, 140]}
+    ctl = _FakeCtl(name="目标")
+    ctl.BoundingRectangle = type("R", (), {"left": 100, "top": 100, "right": 200, "bottom": 140})()
+    el = B.Element(eid=77, hwnd=0, rid=None, control=ctl,
+                   node={"id": 77, "ct": "button", "name": "目标", "rect": store["rect"]},
+                   ts=time.monotonic())
+    orig_resolve = b.resolve
+    b.resolve = lambda spec, hwnd: (el, {"via": "id", "node": el.node, "candidates": []})
+    try:
+        assert b._point_or_element("#77", 0) == (150, 120)
+        assert b._point_or_element("button:目标", 0) == (150, 120)
+        assert b._point_or_element("@10,20", 0) == (10, 20)
+        assert b._point_or_element("10,20", 0) == (10, 20)
+        moves: list[tuple[int, int]] = []
+        orig = (B._move_cursor, B._move_cursor_abs, B._mouse, b._ensure_focus, b._looks_like_caption)
+        B._move_cursor = lambda x, y: moves.append((x, y))
+        B._move_cursor_abs = lambda x, y: moves.append((int(x), int(y)))
+        B._mouse = lambda btn, down: None
+        b._ensure_focus = lambda hwnd: None
+        b._looks_like_caption = lambda hwnd, x, y: False
+        try:
+            r = b._drag(0, None, {"via": "point", "point": [20, 22], "node": {}, "candidates": []},
+                        "#77")
+        finally:
+            B._move_cursor, B._move_cursor_abs, B._mouse, b._ensure_focus, b._looks_like_caption = orig
+        assert r[0] == "click" and r[2] is True, r
+        assert moves[0] == (20, 22) and moves[-1] == (150, 120), f"落点不对: {moves[0]} → {moves[-1]}"
+    finally:
+        b.resolve = orig_resolve
+    return "to=#77 / to=button:目标 → 元素中心 (150,120)；@x,y 与裸坐标行为不变"
+
+
+def t_scroll_to() -> str:
+    pat = _FakeScrollPattern()
+    ctl_visible = _FakeScrollCtl(item=pat, offscreen=False)
+    via, detail, changed = b._scroll_into_view(ctl_visible)
+    assert via == "uia" and "ScrollIntoView" in detail and changed is False, (via, detail, changed)
+    assert pat.calls == 1
+
+    class _Ctl2(_FakeScrollCtl):
+        pass
+
+    ctl_off = _FakeScrollCtl(item=_FakeScrollPattern(), offscreen=True)
+    # ScrollIntoView 成功但 IsOffscreen 仍为 True → changed False（如实）
+    via2, detail2, changed2 = b._scroll_into_view(ctl_off)
+    assert via2 == "uia" and changed2 is False, (via2, detail2, changed2)
+
+    # 退化：没有 ScrollItemPattern，父级也没有 ScrollPattern → 明确失败
+    ctl_plain = _FakeScrollCtl(item=None)
+    try:
+        b._scroll_into_view(ctl_plain)
+        raise AssertionError("不支持滚动却返回成功")
+    except B.BridgeError as exc:
+        assert "无法滚动到视口" in str(exc), str(exc)
+
+    # 退化路径：父容器有 ScrollPattern，滚动后进入视口 → changed True
+    class _Off2:
+        def __init__(self):
+            self.v = True
+
+        def __bool__(self):
+            return self.v
+
+    off = _Off2()
+
+    class _ParentPat:
+        def __init__(self):
+            self.calls = 0
+
+        def Scroll(self, a, b):
+            self.calls += 1
+            off.v = False  # 滚一次就进入视口
+
+    pat2 = _ParentPat()
+
+    class _Parent:
+        def GetScrollPattern(self):
+            return pat2
+
+    class _Child:
+        IsOffscreen = off
+
+        def GetScrollItemPattern(self):
+            raise Exception("no item pattern")
+
+        def GetParentControl(self):
+            return _Parent()
+
+    c = _Child()
+    orig_sleep = B.time.sleep
+    B.time.sleep = lambda s: None
+    try:
+        via3, detail3, changed3 = b._scroll_into_view(c)
+    finally:
+        B.time.sleep = orig_sleep
+    assert via3 == "uia" and "父容器" in detail3 and changed3 is True, (via3, detail3, changed3)
+    assert pat2.calls == 1, pat2.calls
+    return "ScrollIntoView 优先；父容器 ScrollPattern 退化成功；两者都没有 → 明确失败 BridgeError"
+
+
+def t_drag_caption_gate() -> str:
+    """标题栏拖动才校验 window_delta；内容拖动一律 ok（不能误判 FAIL）。"""
+    moves: list[tuple[int, int]] = []
+    orig = (B._move_cursor, B._move_cursor_abs, B._mouse, b._ensure_focus,
+            b._looks_like_caption, W.get_rect, W.is_window, W.is_maximized, W.caption_height)
+    B._move_cursor = lambda x, y: moves.append((x, y))
+    B._move_cursor_abs = lambda x, y: moves.append((int(x), int(y)))
+    B._mouse = lambda btn, down: None
+    b._ensure_focus = lambda hwnd: None
+    W.is_window = lambda h: True
+    W.is_maximized = lambda h: False
+    W.caption_height = lambda h: 30
+    res = {"via": "point", "point": [100, 110], "node": {}, "candidates": []}
+    try:
+        # A) 内容拖动：起点不在标题栏 → ok，且不做 window_delta 校验
+        b._looks_like_caption = lambda hwnd, x, y: False
+        W.get_rect = lambda h: [0, 0, 800, 600]  # 窗口没动
+        via, detail, ok = b._drag(4242, None, res, "@300,400")
+        assert ok and via == "click", (via, detail, ok)
+        assert "drag content" in detail, detail
+        assert "window_delta" not in detail, f"内容拖动不该做窗口位移校验: {detail}"
+
+        # B) 标题栏拖动 + 窗口确实跟随 → ok，且 detail 带 window_delta
+        b._looks_like_caption = lambda hwnd, x, y: True
+        seq = iter([[0, 0, 800, 600], [200, 290, 1000, 890]])
+        W.get_rect = lambda h: next(seq)
+        via2, detail2, ok2 = b._drag(4242, None, res, "@300,400")
+        assert ok2 and "window_delta=(200,290)" in detail2, detail2
+        assert "drag content" not in detail2, detail2
+
+        # C) 标题栏拖动 + 窗口没跟动 → 严格失败（保留我们修过的保护）
+        b._looks_like_caption = lambda hwnd, x, y: True
+        W.get_rect = lambda h: [0, 0, 800, 600]
+        try:
+            b._drag(4242, None, res, "@300,400")
+            raise AssertionError("标题栏拖动窗口未跟随却没报错")
+        except B.BridgeError as exc:
+            assert "拖动没有生效" in str(exc), str(exc)
+    finally:
+        (B._move_cursor, B._move_cursor_abs, B._mouse, b._ensure_focus,
+         b._looks_like_caption, W.get_rect, W.is_window, W.is_maximized,
+         W.caption_height) = orig
+
+    # D) 判定函数本身：几何带 + 内容探针
+    class _Ctl:
+        def __init__(self, ct, parent=None):
+            self.ControlTypeName = ct
+            self._p = parent
+
+        def GetParentControl(self):
+            return self._p
+
+    orig2 = (W.is_window, W.get_rect, W.is_maximized, W.caption_height, B.auto.ControlFromPoint)
+    W.is_window = lambda h: True
+    W.get_rect = lambda h: [100, 200, 900, 800]
+    W.is_maximized = lambda h: False
+    W.caption_height = lambda h: 31
+    try:
+        # 标题栏带内 + 元素是窗口本身 → True
+        B.auto.ControlFromPoint = lambda x, y: _Ctl("WindowControl")
+        assert B.Bridge._looks_like_caption(1, 400, 212) is True
+        # 标题栏带内但元素是文档正文 → False
+        B.auto.ControlFromPoint = lambda x, y: _Ctl("DocumentControl")
+        assert B.Bridge._looks_like_caption(1, 400, 212) is False
+        # 带外（内容区）→ 直接 False，连探针都不需要
+        B.auto.ControlFromPoint = lambda x, y: (_ for _ in ()).throw(AssertionError("不该探针"))
+        assert B.Bridge._looks_like_caption(1, 400, 260) is False
+        # 自绘标题栏（caption_height=0）→ 只有 24px 带
+        W.caption_height = lambda h: 0
+        B.auto.ControlFromPoint = lambda x, y: _Ctl("WindowControl")
+        assert B.Bridge._looks_like_caption(1, 400, 218) is True   # 18px 内
+        assert B.Bridge._looks_like_caption(1, 400, 230) is False  # 30px 外
+    finally:
+        (W.is_window, W.get_rect, W.is_maximized, W.caption_height,
+         B.auto.ControlFromPoint) = orig2
+    return "内容拖动 ok+无窗口校验（drag content）；标题栏跟随→window_delta；标题栏未跟随→失败；判定函数 4 种情形正确"
+
+
+def t_drag_edge_clamp() -> str:
+    """贴边拖动：期望位移按屏幕夹取算 → 合法夹取不再 FAIL；没夹取仍严格。"""
+    orig = (B._move_cursor, B._move_cursor_abs, B._mouse, b._ensure_focus,
+            b._looks_like_caption, W.get_rect, W.is_window, W.is_maximized, W.virtual_screen)
+    B._move_cursor = lambda x, y: None
+    B._move_cursor_abs = lambda x, y: None
+    B._mouse = lambda btn, down: None
+    b._ensure_focus = lambda hwnd: None
+    b._looks_like_caption = lambda hwnd, x, y: True  # 标题栏
+    W.is_window = lambda h: True
+    W.is_maximized = lambda h: False
+    vx, vy, vw, vh = W.virtual_screen()
+    W.virtual_screen = lambda: (vx, vy, vw, vh)
+    res = {"via": "point", "point": [100, 10], "node": {}, "candidates": []}
+    right = vx + vw
+    try:
+        # A) 右边界贴边 + dx>0：Windows 夹住 x（实际 Δx=0），y 正常 → 必须 ok
+        before = [right - 900, 100, right, 700]
+        after = [right - 900, 160, right, 760]          # Δ=(0,60)，光标 Δ=(90,60)
+        seq = iter([before, after])
+        W.get_rect = lambda h: next(seq)
+        via, detail, ok = b._drag(4242, None, res, "@190,70")   # x+90, y+60
+        assert ok, detail
+        assert "exp_wdelta=(0,60)" in detail, f"期望位移应被夹成 (0,60): {detail}"
+        assert "window_delta=(0,60)" in detail, detail
+
+        # B) 没贴边 + 窗口没动 → 仍严格 FAIL（真 bug 保护不变）
+        before2 = [100, 100, 1000, 700]
+        seq2 = iter([before2, before2])
+        W.get_rect = lambda h: next(seq2)
+        try:
+            b._drag(4242, None, res, "@190,70")
+            raise AssertionError("窗口没跟随却没报错（严格性丢了）")
+        except B.BridgeError as exc:
+            assert "拖动没有生效" in str(exc), str(exc)
+            assert "exp_wdelta=(90,60)" in str(exc), str(exc)
+
+        # C) 底边贴边 + dy>0：y 被夹成 0，x 正常 → ok
+        before3 = [300, vy + vh - 600, 1200, vy + vh]
+        after3 = [300 - 80, vy + vh - 600, 1200 - 80, vy + vh]
+        seq3 = iter([before3, after3])
+        W.get_rect = lambda h: next(seq3)
+        via3, detail3, ok3 = b._drag(4242, None, res, "@20,60")  # dx=-80, dy=+50
+        assert ok3, detail3
+        assert "exp_wdelta=(-80,0)" in detail3, detail3
+    finally:
+        (B._move_cursor, B._move_cursor_abs, B._mouse, b._ensure_focus,
+         b._looks_like_caption, W.get_rect, W.is_window, W.is_maximized,
+         W.virtual_screen) = orig
+    return ("贴边+dx>0 → ok，exp_wdelta 被夹成 (0,60)；没贴边窗口没动 → 仍 FAIL（exp=(90,60)）；"
+            "底边贴边 dy 夹取 → ok")
+
+
 def cleanup() -> None:
     h = _calc_hwnd()
     if h and hwnd_alive(h):
@@ -1280,6 +1647,14 @@ def main() -> int:
     check("12.9 hold_mouse", t_hold_mouse_unit)
     check("12.10 hold ms clamp/plumbing", t_hold_act_plumbing)
     check("12.6 drag geometry", t_drag_geometry)
+    check("13.1 marks collect", t_marks_collect)
+    check("13.2 marks annotate", t_marks_annotate)
+    check("13.3 clipboard api", t_clipboard_api)
+    check("13.4 window_move", t_window_move_clamp)
+    check("13.5 drag to element", t_drag_to_element)
+    check("13.6 scroll_to", t_scroll_to)
+    check("13.7 drag caption gate", t_drag_caption_gate)
+    check("13.8 drag edge clamp", t_drag_edge_clamp)
     if "--unit-only" in sys.argv[1:]:
         # 纯单测模式：不碰桌面、不写剪贴板（Lead 正在用机器时用这个）
         passed = sum(1 for r in RESULTS if r[1])

@@ -36,6 +36,9 @@ __all__ = [
     "is_minimized",
     "is_maximized",
     "is_window",
+    "move_window",
+    "clamp_move",
+    "caption_height",
     "WindowGone",
     "ClipboardBusy",
     "LAST_CLIPBOARD_ATTEMPTS",
@@ -597,6 +600,62 @@ def activate_ex(hwnd: int, wait_ms: int = 120) -> dict:
 def activate(hwnd: int, wait_ms: int = 120) -> bool:
     """Bring a window to the foreground (restores minimized / reveals hidden)."""
     return bool(activate_ex(hwnd, wait_ms).get("ok"))
+
+
+def caption_height(hwnd: int) -> int:
+    """Height of the window's non-client caption area, in physical pixels.
+
+    0 means the window draws its own title bar (Chromium / borderless), i.e. the
+    client area starts at the window top.
+    """
+    h = int(hwnd)
+    try:
+        client = wt.RECT()
+        if not user32.GetClientRect(wt.HWND(h), ctypes.byref(client)):
+            return 0
+        pt = wt.POINT(0, 0)
+        if not user32.ClientToScreen(wt.HWND(h), ctypes.byref(pt)):
+            return 0
+        rect = get_rect(h)
+        return max(0, min(200, int(pt.y) - int(rect[1])))
+    except Exception:
+        return 0
+
+
+def clamp_move(
+    x: int, y: int, w: int, h: int, vx: int, vy: int, vw: int, vh: int
+) -> tuple[int, int, int, int]:
+    """Clamp a target window rect into the virtual screen (pure, testable)."""
+    cw = max(80, min(int(w), int(vw)))
+    ch = max(80, min(int(h), int(vh)))
+    nx = max(int(vx), min(int(x), int(vx) + int(vw) - cw))
+    ny = max(int(vy), min(int(y), int(vy) + int(vh) - ch))
+    return nx, ny, cw, ch
+
+
+def move_window(
+    hwnd: int, x: int, y: int, w: int | None = None, h: int | None = None
+) -> list[int]:
+    """Move/resize a window; clamps to the virtual screen. Returns the new rect.
+
+    A maximized window is restored first (SetWindowPos on a zoomed window would
+    only move its restore-rect).
+    """
+    hwnd = int(hwnd)
+    if not is_window(hwnd):
+        raise WindowGone(f"窗口 #{hwnd} 已关闭")
+    rect = get_rect(hwnd)
+    cw = int(w) if w else max(80, rect[2] - rect[0])
+    ch = int(h) if h else max(80, rect[3] - rect[1])
+    nx, ny, cw, ch = clamp_move(x, y, cw, ch, *virtual_screen())
+    if is_maximized(hwnd):
+        user32.ShowWindow(wt.HWND(hwnd), SW_RESTORE)
+        time.sleep(0.12)
+    SWP_NOZORDER = 0x0004
+    SWP_NOACTIVATE = 0x0010
+    user32.SetWindowPos(wt.HWND(hwnd), None, nx, ny, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE)
+    time.sleep(0.05)
+    return get_rect(hwnd)
 
 
 def show_window(hwnd: int, cmd: int) -> bool:
