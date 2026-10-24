@@ -1,0 +1,33 @@
+{
+  "name": "dsh-super-cu",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Super-fast, high-precision Windows computer use for DeepSeek Harness: UI Automation semantic snapshots, stable element ids, batched actions and a visual fallback. Exposes the cu_show / cu_do agent tools.",
+  "keywords": ["dsh", "deepseek-harness", "computer-use", "ui-automation", "windows", "agent", "mcp"],
+  "icon": "./icon.svg",
+  "main": "./cordis.patch.yml",
+  "exports": {
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "src/*.py",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "SKILL.md",
+    "setup.ps1"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "engines": {
+    "dsh": ">=0.2.0"
+  }
+}

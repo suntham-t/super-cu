@@ -1,0 +1,28 @@
+# dsh-super-cu — bundle patch
+#
+# Connects the super-cu computer-use server (a persistent Python UI-Automation
+# bridge) to DeepSeek Harness over stdio. Tools surface as:
+#     mcp__supercu__cu_show   (observe)
+#     mcp__supercu__cu_do     (act, batched)
+#
+# The two __...__ tokens below are written by ./setup.ps1 with this machine's
+# absolute paths (a linked bundle cannot know its own install path at author
+# time). Run setup.ps1 once after cloning, then install the bundle in DSH.
+- insert:
+    - id: super-cu
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: supercu
+        transport: stdio
+        # __SUPER_CU_PYTHON__  -> e.g. C:\Python313\python.exe  (or just "python")
+        command: '__SUPER_CU_PYTHON__'
+        args:
+          - '-u'
+          # __SUPER_CU_SERVER__  -> absolute path to src/server.py
+          - '__SUPER_CU_SERVER__'
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: 'utf-8'
+          SUPER_CU_BUILD: '1'
+        # A broken GUI tool must never brick the user's session.
+        failOnStartupError: false

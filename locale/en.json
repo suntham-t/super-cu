@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Super CU",
+    "description": "Fast, precise Windows computer use over UI Automation: compact element state, stable element ids, batched actions, and a visual fallback. Exposes the cu_show and cu_do agent tools."
+  }
+}
