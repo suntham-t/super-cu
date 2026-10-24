@@ -1122,7 +1122,11 @@ class SuperCuServer:
             to_spec = step.get("to")
             kwargs["to"] = (self._resolve_to_target(to_spec, hwnd)
                             if to_spec else None)
-            kwargs["at"] = target
+            # Do NOT pass ``at`` here.  T1's verified direct call is
+            # ``act(hwnd, "drag", target="@x,y", to="@x2,y2")``; adding ``at``
+            # makes bridge.act take a different (point-only) branch and was the
+            # only call-shape difference in the failing cu_do path.  The start
+            # point is still the exact @x,y via resolve(target).
             kwargs["hold_ms"] = step.get("hold_ms")
         elif op in ("hold", "hold_mouse"):
             kwargs["ms"] = step.get("ms")
@@ -1139,6 +1143,11 @@ class SuperCuServer:
         else:
             kwargs["app"] = step.get("app")
 
+        if os.environ.get("SUPER_CU_DEBUG_DRAG") and op == "drag":
+            # diagnosis switch only: never appears in protocol output
+            log(f"DEBUG drag hwnd={hwnd} target={target!r} "
+                f"at={kwargs.get('at')!r} to={kwargs.get('to')!r} "
+                f"hold_ms={kwargs.get('hold_ms')!r}")
         try:
             res = b.bridge.act(hwnd or 0, action, **kwargs)
         except TypeError:

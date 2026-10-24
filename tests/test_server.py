@@ -1096,6 +1096,59 @@ def test_observe_budget_inprocess():
 
 
 # --------------------------------------------------------------------------- #
+# 3c. drag step pass-through (T3 regression: X delta lost)
+# --------------------------------------------------------------------------- #
+def test_drag_passthrough_inprocess():
+    section("drag step pass-through (in-process)")
+    import server as server_mod
+    import mock_bridge
+
+    mock_bridge.reset()
+    try:
+        srv = server_mod.SuperCuServer(force_mock=True)
+        bridge = srv.backend.bridge
+        recorded = []
+        original = bridge.act
+
+        def recording(hwnd, action, **kwargs):
+            if action == "drag":
+                recorded.append({"hwnd": hwnd, **kwargs})
+            return original(hwnd, action, **kwargs)
+
+        bridge.act = recording
+
+        result = srv.cu_do({"steps": [
+            {"op": "drag", "target": "@650,258", "to": "@740,318",
+             "window": "#1002"}]})
+        result_text = text_of(result)
+        check("drag step succeeds", not is_error(result),
+              result_text.splitlines()[0][:100] if result_text else "")
+        check("drag step forwards target/to unchanged",
+              len(recorded) == 1
+              and recorded[0].get("target") == "@650,258"
+              and recorded[0].get("to") == "@740,318",
+              str(recorded[0] if recorded else None)[:180])
+        check("drag step does not double the start via at=",
+              bool(recorded) and not recorded[0].get("at"),
+              str(recorded[0].get("at") if recorded else None))
+        check("drag step keeps hold_ms pass-through (None by default)",
+              bool(recorded) and "hold_ms" in recorded[0]
+              and recorded[0]["hold_ms"] is None,
+              str(recorded[0].get("hold_ms") if recorded else None))
+
+        recorded.clear()
+        selector = srv.cu_do({"steps": [
+            {"op": "drag", "target": "@650,258", "to": "button:刷新",
+             "window": "#1002"}]})
+        to_value = str(recorded[0].get("to") or "") if recorded else ""
+        check("drag.to element selector resolves to an @x,y point",
+              not is_error(selector) and bool(re.fullmatch(r"@\d+,\d+", to_value)),
+              to_value or "no call")
+    finally:
+        mock_bridge.reset()
+
+
+# --------------------------------------------------------------------------- #
 # 4. real bridge regression (runs automatically once T1 lands)
 # --------------------------------------------------------------------------- #
 def test_real():
@@ -1259,6 +1312,7 @@ def main(argv) -> int:
     test_compact()
     test_coordinates_inprocess()
     test_observe_budget_inprocess()
+    test_drag_passthrough_inprocess()
     test_protocol()
     real_available = os.path.exists(os.path.join(SRC, "bridge.py"))
     if "--mock-only" not in argv and (real_available or "--real" in argv):

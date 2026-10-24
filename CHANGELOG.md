@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.2 — 2026-10-24
+
+### Changed
+- **cu_do no longer passes a duplicate t= to the drag action.** The server's drag step passed an extra
+  t= argument, which routed ridge.act through its point-only branch instead of the
+  element/target path used by the verified direct call. The duplicate is gone and a
+  passthrough test asserts the exact call shape (target/to/hold_ms, no t).
+  **The caption-drag horizontal issue is NOT fixed by this** — bridge-level drags move
+  both axes, but the same drag driven through cu_do still moves only vertically.
+  Reproduction, DEBUG output and the five-round investigation live in
+  ench/regress-report.md; tracked as a known issue in the README.
+- SUPER_CU_DEBUG_DRAG=1 prints one stderr line per drag (target/at/to/hold_ms) for field
+  diagnosis; never part of the protocol output.
+
 ## 1.1.1 — 2026-10-24
 
 ### Fixed
