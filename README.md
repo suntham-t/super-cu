@@ -101,6 +101,14 @@ cd super-cu
 > 通过官方 `@deepseek-ai/dsh-mcp-client` 行拉起一个常驻 Python MCP server（stdio）。
 > 目录结构可直接被 `plugin_manager(install_bundle)` 或插件面板安装。
 
+### 插件市场 / Plugin market
+
+本仓库按 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 的收录要求准备：
+`package.json` 声明 `dsh.bundle`、根目录有 `cordis.patch.yml`、仓库带 `dsh-plugin` topic。
+市场条目位于 [`.market/suntham-t__super-cu.yml`](.market/suntham-t__super-cu.yml)，
+用 `./submit-to-market.ps1` 一键投稿（fork → 上传条目 → 开 PR，无需克隆 200MB 索引仓库）。
+
+
 ## 文件
 
 ```
