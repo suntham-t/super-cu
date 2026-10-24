@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.1 — 2026-10-24
+
+### Fixed
+- **Caption drags follow the cursor again.** An earlier optimisation routed every drag step
+  through SendInput(MOUSEEVENTF_ABSOLUTE|VIRTUALDESK) so raw-input apps (Blender, games)
+  could see the motion; Windows' modal window-move loop only follows *real* cursor movement,
+  so the window stopped following horizontally. Caption drags now step with SetCursorPos
+  only; content drags keep the injected heartbeat that raw-input apps need. New unit test
+  asserts the routing (caption => SetCursorPos only) so the bug cannot come back.
+- Drag verification is now expected-delta aware: the expectation is clamped to the virtual
+  screen before comparing (exp_wdelta= appears in the detail line), so legitimate
+  screen-edge clamping is no longer reported as a failed drag.
+
 ## 1.1.0 — 2026-10-24
 
 Capability round: five opt-in additions, no change to any existing default path.

@@ -1591,6 +1591,61 @@ def t_drag_edge_clamp() -> str:
             "底边贴边 dy 夹取 → ok")
 
 
+def t_drag_path_axis() -> str:
+    """插值路径必须两轴都推进（X 分量被吞掉的回归护栏）+ 鼠标事件路由正确。"""
+    pts = B.drag_path(100, 100, 190, 160)
+    assert len(pts) == 10, pts
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    assert xs == sorted(xs) and xs[-1] == 190, f"X 未单调推进: {xs}"
+    assert ys == sorted(ys) and ys[-1] == 160, f"Y 未单调推进: {ys}"
+    assert len(set(xs)) >= 8, f"X 只有 {len(set(xs))} 个不同值（被 int 截断？）: {xs}"
+    assert len(set(ys)) >= 8, f"Y 只有 {len(set(ys))} 个不同值: {ys}"
+    # 单轴拖动：X 恒定、Y 走完
+    pts2 = B.drag_path(50, 50, 50, 130)
+    assert {p[0] for p in pts2} == {50} and pts2[-1] == (50, 130), pts2
+    # 只差 1px 也不能丢
+    pts3 = B.drag_path(10, 10, 11, 11, steps=4)
+    assert pts3[-1] == (11, 11) and len({p[0] for p in pts3}) >= 2, pts3
+    # 反向必须严格递减
+    pts4 = B.drag_path(200, 200, 120, 140)
+    xs4 = [p[0] for p in pts4]
+    assert xs4 == sorted(xs4, reverse=True), xs4
+
+    # 路由：标题栏拖动只能走 SetCursorPos；SendInput 会把 modal move 的增量算成 0
+    orig = (B._move_cursor, B._move_cursor_abs, B._mouse, b._ensure_focus,
+            b._looks_like_caption, W.get_rect, W.is_window, W.is_maximized)
+    calls: list[str] = []
+    B._move_cursor = lambda x, y: calls.append("set")
+    B._move_cursor_abs = lambda x, y: calls.append("send")
+    B._mouse = lambda btn, down: None
+    b._ensure_focus = lambda hwnd: None
+    W.is_window = lambda h: True
+    W.is_maximized = lambda h: False
+    W.get_rect = lambda h: [0, 0, 800, 600]
+    res = {"via": "point", "point": [100, 100], "node": {}, "candidates": []}
+    try:
+        b._looks_like_caption = lambda hwnd, x, y: True
+        calls.clear()
+        seq = iter([[0, 0, 800, 600], [90, 60, 890, 660]])   # 窗口确实跟随
+        W.get_rect = lambda h: next(seq)
+        b._drag(4242, None, res, "@190,160")
+        assert "set" in calls, f"标题栏拖动没有 SetCursorPos: {calls}"
+        assert "send" not in calls, f"标题栏拖动混入了 SendInput 移动（会丢失位移）: {calls}"
+        b._looks_like_caption = lambda hwnd, x, y: False
+        calls.clear()
+        W.get_rect = lambda h: [0, 0, 800, 600]
+        b._drag(4242, None, res, "@190,160")
+        assert "set" in calls and "send" in calls, f"内容拖动缺少 SendInput 心跳: {calls}"
+    finally:
+        (B._move_cursor, B._move_cursor_abs, B._mouse, b._ensure_focus,
+         b._looks_like_caption, W.get_rect, W.is_window, W.is_maximized) = orig
+    return (
+        "drag_path(100,100→190,160)：X 10 个递增值到 190、Y 到 160；单轴/1px/反向都正确；"
+        "标题栏→仅 SetCursorPos，内容→SetCursorPos+SendInput 心跳"
+    )
+
+
 def cleanup() -> None:
     h = _calc_hwnd()
     if h and hwnd_alive(h):
@@ -1655,6 +1710,7 @@ def main() -> int:
     check("13.6 scroll_to", t_scroll_to)
     check("13.7 drag caption gate", t_drag_caption_gate)
     check("13.8 drag edge clamp", t_drag_edge_clamp)
+    check("13.9 drag path axes/route", t_drag_path_axis)
     if "--unit-only" in sys.argv[1:]:
         # 纯单测模式：不碰桌面、不写剪贴板（Lead 正在用机器时用这个）
         passed = sum(1 for r in RESULTS if r[1])

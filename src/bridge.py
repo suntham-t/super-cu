@@ -69,7 +69,7 @@ __all__ = [
     "hold_mouse",
     "collect_marks",
     "annotate_marks",
-    "clamp_expected_delta",
+    "drag_path",
 ]
 
 
@@ -852,6 +852,23 @@ def _area(r: list[int]) -> int:
 
 
 _MARK_COLORS = [(255, 64, 64), (64, 160, 255), (46, 204, 113), (255, 176, 32)]
+
+
+def drag_path(x: int, y: int, tx: int, ty: int, steps: int = 10) -> list[tuple[int, int]]:
+    """Interpolated drag path (pure). Must advance on BOTH axes, no int-truncation.
+
+    Unit-tested: regression guard for "the X component silently vanished".
+    """
+    steps = max(1, int(steps))
+    pts: list[tuple[int, int]] = []
+    for i in range(1, steps + 1):
+        pts.append(
+            (
+                int(round(x + (tx - x) * i / steps)),
+                int(round(y + (ty - y) * i / steps)),
+            )
+        )
+    return pts
 
 
 def _clamp_int(v: int, lo: int, hi: int) -> int:
@@ -2519,12 +2536,16 @@ class Bridge:
                 detail_hold = ""
         else:
             detail_hold = ""
-        steps = 10
-        for i in range(1, steps + 1):
-            px = int(round(x + (tx - x) * i / steps))
-            py = int(round(y + (ty - y) * i / steps))
-            _move_cursor_abs(px, py)  # proper MOUSEMOVE events while pressed
-            time.sleep(0.015)
+        path = drag_path(x, y, tx, ty)
+        for i, (px, py) in enumerate(path):
+            # 标题栏拖动靠 Windows 的 modal move 循环：它只跟随真实光标位置，
+            # SendInput 注入的绝对移动会让它把增量算成 0（实测窗口完全不动）。
+            # 所以先 SetCursorPos（可靠驱动窗口移动）。
+            _move_cursor(px, py)
+            if not caption and i + 1 < len(path):
+                # 内容拖动（canvas/游戏/拖放）额外发真实 MOUSEMOVE，便于按帧读输入的 app
+                _move_cursor_abs(px, py)
+            time.sleep(0.02)
         time.sleep(0.05)
         _mouse("left", False)
         time.sleep(0.08)
