@@ -3,12 +3,15 @@
 ## 1.1.1 — 2026-10-24
 
 ### Fixed
-- **Caption drags follow the cursor again.** An earlier optimisation routed every drag step
+- **Bridge-level caption drags follow the cursor again (server path still under investigation).** An earlier optimisation routed every drag step
   through SendInput(MOUSEEVENTF_ABSOLUTE|VIRTUALDESK) so raw-input apps (Blender, games)
   could see the motion; Windows' modal window-move loop only follows *real* cursor movement,
   so the window stopped following horizontally. Caption drags now step with SetCursorPos
   only; content drags keep the injected heartbeat that raw-input apps need. New unit test
   asserts the routing (caption => SetCursorPos only) so the bug cannot come back.
+  **Known issue:** driving the same drag through the cu_do tool still loses the
+  horizontal component (bridge-level call verified OK); reproduction is in
+  ench/regress-report.md.
 - Drag verification is now expected-delta aware: the expectation is clamped to the virtual
   screen before comparing (exp_wdelta= appears in the detail line), so legitimate
   screen-edge clamping is no longer reported as a failed drag.

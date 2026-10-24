@@ -163,6 +163,8 @@ docs/images/           真实任务截图
 - **Chromium 的 `view=text`** 取不到正文（TextPattern 为空）→ 用 `controls`（TextControl 的 name 就是文本）。
 - **控制台窗口**（conhost）UIA 只有十几个节点、读不到输出文本 → 退路：截图或用非 UI 手段。
 - **UIPI**：管理员权限窗口可能拒绝输入/读取。
+- **标题栏拖动的水平位移**：cu_do 路径目前会丢 x（bridge 直连正常，server 侧待修；
+  复现与数据见 ench/regress-report.md）。内容拖动、drag.to=#id 不受影响。
 - **指针锁定 + raw input 的游戏**（如 Minecraft）：`SetCursorPos` 无法转视角；要用游戏内命令或键位。
 - **Office 现代「保存此文件」对话框**不接受全路径 → 先「更多选项…」→「浏览」进经典对话框。
 - 一次 `cu_do` 建议 ≤10 步（批量期间持有 GUI 锁，其它智能体会等待）。
