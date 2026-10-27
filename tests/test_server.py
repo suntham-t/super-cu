@@ -223,7 +223,7 @@ def test_protocol():
         check("initialize capabilities.tools == {}",
               result.get("capabilities") == {"tools": {}})
         check("initialize serverInfo",
-              result.get("serverInfo") == {"name": "supercu", "version": "1.3.0"},
+              result.get("serverInfo") == {"name": "supercu", "version": "1.3.1"},
               str(result.get("serverInfo")))
 
         second = session.send("initialize", {})

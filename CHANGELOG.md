@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.1 — 2026-10-27
+
+### Fixed
+
+- **cu_do inline state raced the repaint after view-switching clicks.** With `observe=auto/state` the
+  inline snapshot was taken immediately after the action; apps such as WeChat repaint the new pane a
+  few hundred ms later, so the state block still showed the OLD view (and an `expect` on a text that
+  already existed in the old view — e.g. the search box — could confirm a switch that had not
+  rendered yet). The inline snapshot now waits a bounded grace (150-250 ms, derived from `settle_ms`)
+  after a changed or failed step before rendering. Best effort: apps slower than ~250 ms (WeChat chat
+  loading can be ~300 ms) may still show the previous pane; a follow-up `cu_show` is the reliable check.
+- Mock backend (instantaneous) skips the grace so the protocol suite keeps its speed.
+
+### Notes
+
+- No schema or behavior change for actions themselves; only the timing of the inline observation.
+- Docs: `SKILL.md` gains a "view-switch state check" note (do not trust `expect` alone, re-`cu_show`
+  after view-switching clicks) and README documents the timing window.
+
 ## 1.3.0 — 2026-10-27
 
 ### Added

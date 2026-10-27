@@ -80,7 +80,7 @@ def _gui_lock():
     return _GUI_MOD
 
 SERVER_NAME = "supercu"
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.3.1"
 DEFAULT_PROTOCOL = "2024-11-05"
 SHOT_MAX_LONG = 1728          # long side of the JPEG we hand to the client
 MAX_STEPS = 50
@@ -1287,6 +1287,13 @@ class SuperCuServer:
         text = "\n".join(lines)
         state_needed = (observe == "state"
                         or (observe == "auto" and (failed or last_changed)))
+        if state_needed and (last_changed or failed) and b.kind != "mock":
+            # Repaint race: right after a click that switches views (e.g. a
+            # WeChat chat switch) the UIA tree still shows the OLD pane for a
+            # few hundred ms.  Give the UI a short settle before the inline
+            # snapshot, otherwise the state block contradicts the action.
+            settle_grace = min(250, max(150, int(settle_ms or 0)))
+            time.sleep(settle_grace / 1000.0)
         if state_needed:
             hwnd = last_hwnd or self.last_hwnd
             if hwnd:
