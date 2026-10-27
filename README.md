@@ -115,6 +115,15 @@ op 一览：
 - 细节/证据/复现：`docs/OPTIMIZATION.md`、`docs/OPT-AFTER.md`、`docs/OPT-VERIFY.md`；
   环境开关 `SUPER_CU_NO_CACHE` / `SUPER_CU_NO_PREFETCH` / `SUPER_CU_SETTLE_MIN_MS`。
 
+### 1.5 新增：跨窗口拖拽 / 滚动到元素
+
+- scroll_until_visible：真实滚轮把元素滚进视口，不依赖 UIA ScrollPattern（微信/Electron 自绘列表可用）。
+- drag.to_window + to:"#id"：跨窗口拖放，在目标窗口里解析元素落点；auto_scroll 拖前先把源滚进视口。
+- drag 不再静默成功：起点在窗口外、落点不在目标窗口、drop 被别的窗口接走都会报错；
+  成功时 detail 带 drop_window=#hwnd pid=.. class=..。
+- cu_show 的 ~ 按几何判定（rect 不在窗口内即 offscreen）。
+- 内联状态按需重试，不再给每次 observe=state 固定加 150ms。
+
 ### 1.4 新增：OpenAI CUA 动作面对齐
 
 OpenAI 2026 版 computer-use driver 的 9 个动作（screenshot / click / double_click / drag / keypress / move /

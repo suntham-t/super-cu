@@ -80,7 +80,7 @@ def _gui_lock():
     return _GUI_MOD
 
 SERVER_NAME = "supercu"
-SERVER_VERSION = "1.4.0"
+SERVER_VERSION = "1.5.0"
 DEFAULT_PROTOCOL = "2024-11-05"
 SHOT_MAX_LONG = 1728          # long side of the JPEG we hand to the client
 MAX_STEPS = 50
@@ -90,10 +90,10 @@ MAX_MAX_NODES = 400
 NO_GUI_OPS = frozenset({"wait", "assert"})
 WAIT_KINDS = ("text", "element", "window", "idle", "change", "gone")
 OPS = ("click", "dblclick", "rightclick", "hover", "focus", "set", "type",
-       "key", "hold", "hold_mouse", "scroll", "scroll_to", "drag", "select",
-       "invoke", "toggle", "expand", "collapse", "activate", "launch", "close",
-       "minimize", "maximize", "wait", "assert", "paste", "clipboard",
-       "window_move")
+       "key", "hold", "hold_mouse", "scroll", "scroll_to", "scroll_until_visible",
+       "drag", "select", "invoke", "toggle", "expand", "collapse", "activate",
+       "launch", "close", "minimize", "maximize", "wait", "assert", "paste",
+       "clipboard", "window_move")
 HOLD_MIN_MS = 20
 HOLD_MAX_MS = 10000
 #: cu_do ops that may run in background (no restore / no foreground focus).
@@ -104,7 +104,11 @@ BACKGROUND_OPS = frozenset({"invoke", "toggle", "select", "expand", "collapse",
 #: Ops that inherently need real foreground focus or screen coordinates.
 FOREGROUND_OPS = frozenset({"click", "dblclick", "rightclick", "hover", "focus",
                             "type", "key", "paste", "hold", "hold_mouse",
-                            "scroll", "drag", "scroll_to", "launch", "activate"})
+                            "scroll", "drag", "scroll_to", "scroll_until_visible",
+                            "launch", "activate"})
+#: Ops that can switch the visible pane; used by the adaptive inline-state retry.
+VIEW_CHANGE_OPS = frozenset({"click", "dblclick", "rightclick", "invoke",
+                             "toggle", "select", "expand", "collapse"})
 MOUSE_BUTTONS = ("left", "right", "middle")
 #: CUA parity: a click can target any pointer button (wheel click = middle).
 CLICK_BUTTONS = ("left", "right", "middle", "back", "forward")
@@ -338,6 +342,29 @@ def _as_path(value):
     return out
 
 
+def _text_sig(text: str) -> int:
+    """Cheap signature of a rendered state block (process-local equality)."""
+    return hash(text or "")
+
+
+def _rects_overlap(a, b) -> bool:
+    """True when two [l,t,r,b] rects overlap."""
+    try:
+        return (int(a[0]) < int(b[2]) and int(b[0]) < int(a[2])
+                and int(a[1]) < int(b[3]) and int(b[1]) < int(a[3]))
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
+def _is_selector(spec) -> bool:
+    """#id / ct:name style target (not an @x,y point)."""
+    s = (spec or "").strip()
+    if s.startswith("#"):
+        return True
+    head = s.split(":", 1)[0]
+    return ":" in s and head.isalpha() and head.islower()
+
+
 # --------------------------------------------------------------------------- #
 # backend loading (T1's windows.py + bridge.py, or the bundled mock)
 #
@@ -510,6 +537,8 @@ CU_DO = {
         "drag 的 to 可直接写 #id / ct:名字。"
         "兼容 OpenAI CUA 动作面：click 可指定 button(left/right/middle/back/forward)、"
         "scroll 可用 axis=x 横向、drag 可给 path 路径点、指针动作可用 modifiers 按住 ctrl/shift/alt/win。"
+        "scroll_until_visible 用滚轮把 #id 滚进视口（微信/Electron 自绘列表也能用）；"
+        "drag 支持 to_window（在目标窗口里解析 #id 落点，跨窗口拖放）与 auto_scroll（拖前先滚到源元素可见）。"
     ),
     "inputSchema": {
         "type": "object",
@@ -577,6 +606,23 @@ CU_DO = {
                             "items": {"type": "string", "enum": list(MOD_NAMES)},
                             "description": "按住这些修饰键执行本步的指针动作（click/dblclick/rightclick/hover/drag/scroll），CUA keys 的等价物",
                         },
+                        "to_window": {
+                            "type": "string",
+                            "description": "drag 的落点窗口（#hwnd/标题/进程名）；给了且 to 是 #id/ct:名字 时在目标窗口里解析落点（跨窗口拖放用）",
+                        },
+                        "auto_scroll": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "drag 前先把源元素滚进视口（自绘列表也能用）；默认关",
+                        },
+                        "max_steps": {
+                            "type": "integer",
+                            "description": "scroll_until_visible / drag.auto_scroll 最多滚动步数（默认 30，1-200）",
+                        },
+                        "at": {
+                            "type": "string",
+                            "description": "scroll_until_visible 的滚动落点（@x,y；省略=窗口中心）",
+                        },
                         "hold_ms": {
                             "type": "integer",
                             "description": "drag 按下后先保持多少毫秒再移动（默认保持现状）",
@@ -621,6 +667,7 @@ class SuperCuServer:
         self.last_shot = None          # normalized shot meta for @n / @img
         self.last_crop = None          # compact.format_snapshot crop stats
         self._prefetch_started = False
+        self._state_sig: dict = {}
         self._batch_background = False
         self._background_effective = False
         self._init_backend(force_mock)
@@ -769,10 +816,12 @@ class SuperCuServer:
         snap = self._snapshot(hwnd, view="controls", max_nodes=max_nodes)
         self.snapshots[hwnd] = snap
         self.last_hwnd = hwnd
+        self._mark_offscreen(hwnd, snap)
         crop_stats: dict = {}
         text = compact.format_snapshot(snap, view="controls",
                                        max_lines=max_nodes, stats=crop_stats)
         self.last_crop = crop_stats
+        self._state_sig[int(hwnd)] = _text_sig(text)
         if crop_stats.get("budget_cropped"):
             log(f"cu_do observe budget crop hwnd={hwnd} "
                 f"hidden={crop_stats.get('hidden')}")
@@ -1123,12 +1172,14 @@ class SuperCuServer:
             snap = self._snapshot(hwnd, view=view, max_nodes=max_nodes, filt=filt)
             self.snapshots[hwnd] = snap
             self.last_hwnd = hwnd
+            self._mark_offscreen(hwnd, snap)
             display_lines = max_nodes if view == "controls" and not filt else None
             crop_stats: dict = {}
             text = compact.format_snapshot(snap, view=view, filter=filt,
                                            max_lines=display_lines,
                                            stats=crop_stats)
             self.last_crop = crop_stats
+            self._state_sig[int(hwnd)] = _text_sig(text)
             if crop_stats.get("budget_cropped"):
                 log(f"cu_show budget crop hwnd={hwnd} "
                     f"hidden={crop_stats.get('hidden')} "
@@ -1265,6 +1316,41 @@ class SuperCuServer:
                         f"steps[{idx}].modifiers 只用于指针动作"
                         "（click/dblclick/rightclick/hover/drag/scroll）")
                 _as_modifiers(step["modifiers"])
+            if op == "scroll_until_visible":
+                tgt = step.get("target")
+                if not isinstance(tgt, str) or not tgt.startswith("#"):
+                    raise RpcError(
+                        -32602,
+                        f'steps[{idx}].op="scroll_until_visible" 需要 target="#id"'
+                        '（先 cu_show 取 id）')
+            if step.get("to_window") is not None:
+                if op != "drag":
+                    raise RpcError(-32602, f"steps[{idx}].to_window 只用于 drag")
+                tw = step.get("to_window")
+                if isinstance(tw, bool) or not isinstance(tw, (str, int)):
+                    raise RpcError(-32602,
+                                   f"steps[{idx}].to_window 必须是字符串或整数")
+            if step.get("auto_scroll") is not None:
+                if op != "drag":
+                    raise RpcError(-32602, f"steps[{idx}].auto_scroll 只用于 drag")
+                if not isinstance(step.get("auto_scroll"), bool):
+                    raise RpcError(-32602,
+                                   f"steps[{idx}].auto_scroll 必须是布尔值")
+            if step.get("max_steps") is not None:
+                if op not in ("drag", "scroll_until_visible"):
+                    raise RpcError(-32602,
+                                   f"steps[{idx}].max_steps 只用于 drag / scroll_until_visible")
+                v = step.get("max_steps")
+                if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 200:
+                    raise RpcError(-32602,
+                                   f"steps[{idx}].max_steps 必须是 1-200 的整数")
+            if step.get("at") is not None:
+                if op != "scroll_until_visible":
+                    raise RpcError(-32602,
+                                   f"steps[{idx}].at 只用于 scroll_until_visible")
+                if not isinstance(step.get("at"), str):
+                    raise RpcError(-32602,
+                                   f"steps[{idx}].at 必须是坐标字符串（@x,y）")
             for key in ("amount", "timeout_ms", "hold_ms", "x", "y", "w", "h"):
                 value = step.get(key)
                 if value is not None and (isinstance(value, bool)
@@ -1280,6 +1366,7 @@ class SuperCuServer:
         failed = None
         last_changed = False
         last_hwnd = None
+        last_op = None
         # Locking contract: bridge.act() acquires the shared desktop lock itself
         # for every focus / key / mouse action (T1's LOCK_ACTIONS), and this
         # server wraps its own windows.activate() call below.  Holding the lock
@@ -1290,6 +1377,7 @@ class SuperCuServer:
             with ctx:
                 for idx, step in enumerate(steps, 1):
                     label = _step_label(step)
+                    last_op = step.get("op")
                     try:
                         res = self._exec_step(step)
                     except ToolError as exc:
@@ -1364,18 +1452,25 @@ class SuperCuServer:
         text = "\n".join(lines)
         state_needed = (observe == "state"
                         or (observe == "auto" and (failed or last_changed)))
-        if state_needed and (last_changed or failed) and b.kind != "mock":
-            # Repaint race: right after a click that switches views (e.g. a
-            # WeChat chat switch) the UIA tree still shows the OLD pane for a
-            # few hundred ms.  Give the UI a short settle before the inline
-            # snapshot, otherwise the state block contradicts the action.
-            settle_grace = min(250, max(150, int(settle_ms or 0)))
-            time.sleep(settle_grace / 1000.0)
         if state_needed:
             hwnd = last_hwnd or self.last_hwnd
             if hwnd:
                 try:
+                    prev_sig = self._state_sig.get(int(hwnd))
                     state_text = self._observe_state(int(hwnd))
+                    sig = _text_sig(state_text)
+                    if ((last_changed or failed) and observe != "none"
+                            and (failed or last_op in VIEW_CHANGE_OPS)
+                            and prev_sig is not None and sig == prev_sig
+                            and b.kind != "mock"):
+                        # Still looks identical right after an action that
+                        # should switch the pane: the app may be repainting.
+                        # Pay a bounded retry only in this case; the common
+                        # fast path keeps a single snapshot.
+                        grace = min(200, max(80, int(settle_ms or 0)))
+                        time.sleep(grace / 1000.0)
+                        state_text = self._observe_state(int(hwnd))
+                        sig = _text_sig(state_text)
                     text += ("\n" if text else "") + state_text
                 except Exception as exc:
                     log("observe after cu_do skipped: "
@@ -1419,6 +1514,8 @@ class SuperCuServer:
             return self._clipboard_step(step)
         if op == "window_move":
             return self._window_move_step(step)
+        if op == "scroll_until_visible":
+            return self._scroll_until_visible_step(step)
 
         if op in NO_GUI_OPS:
             kind, value = _wait_kind(step)
@@ -1498,8 +1595,38 @@ class SuperCuServer:
         }
         if op == "drag":
             to_spec = step.get("to")
-            kwargs["to"] = (self._resolve_to_target(to_spec, hwnd)
-                            if to_spec else None)
+            to_win_spec = step.get("to_window")
+            to_hwnd = None
+            if to_win_spec is not None:
+                try:
+                    to_hwnd = b.windows.resolve_hwnd(str(to_win_spec))
+                except Exception:
+                    to_hwnd = None
+                if not to_hwnd:
+                    raise ToolError(
+                        f"drag.to_window={to_win_spec!r} 解析不到窗口",
+                        advice="用 #hwnd / 标题 / 进程名；先 cu_show scope=desktop 看 #hwnd")
+                try:
+                    minimized = bool(b.windows.is_minimized(int(to_hwnd)))
+                except Exception:
+                    minimized = False
+                if minimized:
+                    raise ToolError(
+                        f"drag 目标窗口 #{int(to_hwnd)} 最小化，drop 收不到",
+                        advice="先 activate 目标窗口再拖，或让它保持可见")
+                kwargs["to_window"] = int(to_hwnd)
+            if to_spec and to_hwnd and _is_selector(to_spec):
+                kwargs["to"] = self._to_point_in_window(int(to_hwnd), to_spec)
+            else:
+                kwargs["to"] = (self._resolve_to_target(to_spec, hwnd)
+                                if to_spec else None)
+            if step.get("auto_scroll") and isinstance(target, str) and target.startswith("#"):
+                self._scroll_until_visible_step({
+                    "target": target,
+                    "window": step.get("window"),
+                    "amount": step.get("amount") or 3,
+                    "max_steps": step.get("max_steps") or 30,
+                })
             path_spec = _as_path(step.get("path"))
             if path_spec:
                 kwargs["path"] = [self._to_point_spec(p) for p in path_spec]
@@ -1740,6 +1867,130 @@ class SuperCuServer:
             cy = (int(rect[1]) + int(rect[3])) // 2
             return f"@{cx},{cy}"
         return s
+
+    def _mark_offscreen(self, hwnd, snap):
+        """Mark UIA nodes whose rect does not intersect the window as offscreen.
+
+        Some apps (WeChat message list) keep scrolled-out items in the UIA tree
+        with a stale rect but IsOffscreen=False; an agent that trusts the tree
+        then clicks/drags at coordinates on the desktop.
+        """
+        try:
+            win_rect = self._b().windows.get_rect(int(hwnd))
+        except Exception:
+            return
+        for node in snap.get("nodes") or []:
+            try:
+                rect = node.get("rect") or []
+                if len(rect) < 4:
+                    continue
+                if (int(rect[2]) <= int(rect[0]) or int(rect[3]) <= int(rect[1])
+                        or not _rects_overlap(rect, win_rect)):
+                    node["offscreen"] = True
+            except (TypeError, ValueError):
+                continue
+
+    def _scroll_until_visible_step(self, step):
+        """Wheel-based scroll-to-element that also works on self-drawn lists.
+
+        UIA ScrollItemPattern/ScrollPattern don't exist in WeChat/Electron
+        custom lists, so we scroll with real wheel events and check the element
+        rect against the window rect after every step.
+        """
+        b = self._b()
+        started = time.perf_counter()
+        target = step.get("target")
+        if not isinstance(target, str) or not target.strip():
+            raise ToolError(
+                "scroll_until_visible 需要 target（#id）",
+                advice="先 cu_show 拿到元素 id，再用 #id 作为 target")
+        if not target.startswith("#"):
+            raise ToolError(
+                f"scroll_until_visible 的 target 必须是 #id，收到 {target!r}",
+                advice="先 cu_show 确认元素并取 #id（坐标/选择器请改用 scroll 或 @n）")
+        try:
+            eid = int(target[1:])
+        except ValueError:
+            raise ToolError(f"元素 id 格式应为 #123: {target!r}")
+        if b.kind == "mock":
+            return {"ok": True, "via": "scroll", "ms": 1,
+                    "detail": f"mock: {target} 视为可见", "changed": True,
+                    "hwnd": None}
+        max_steps = _as_int(step, "max_steps", 30, 1, 200)
+        amount = _as_int(step, "amount", 3, 1, 30)
+        hwnd = self._step_hwnd(step, activate=True)
+        if not hwnd:
+            raise ToolError("scroll_until_visible 没有目标窗口",
+                            advice="给 window= 或先 activate 一个窗口")
+        win_rect = b.windows.get_rect(hwnd)
+        cx = (int(win_rect[0]) + int(win_rect[2])) // 2
+        cy = (int(win_rect[1]) + int(win_rect[3])) // 2
+        at = step.get("at")
+        if not (isinstance(at, str) and at.strip().startswith("@")):
+            at = f"@{cx},{cy}"
+        direction = -1
+        last_rect = None
+        same = 0
+        steps = 0
+        for _ in range(max_steps):
+            snap = self._snapshot(hwnd, view="controls", max_nodes=1200)
+            node = None
+            for cand in snap.get("nodes") or []:
+                if int(cand.get("id") or -1) == eid:
+                    node = cand
+                    break
+            if node is not None:
+                rect = node.get("rect") or []
+                if len(rect) >= 4 and int(rect[2]) > int(rect[0]) and int(rect[3]) > int(rect[1]):
+                    if _rects_overlap(rect, win_rect):
+                        self.snapshots[hwnd] = snap
+                        self.last_hwnd = hwnd
+                        self._mark_offscreen(hwnd, snap)
+                        return {"ok": True, "via": "scroll",
+                                "ms": max(1, int((time.perf_counter() - started) * 1000)),
+                                "detail": f"滚动 {steps} 步后可见 rect={list(rect)}",
+                                "changed": True, "hwnd": hwnd}
+                    mid_y = (int(rect[1]) + int(rect[3])) // 2
+                    direction = -1 if mid_y < cy else 1
+                    if last_rect == list(rect):
+                        same += 1
+                        if same >= 4:
+                            raise ToolError(
+                                f"滚动无进展：{target} rect={list(rect)} 连续 {same} 次不变",
+                                advice="元素可能不在可滚动容器里；换窗口/先展开列表，或改用 scroll/坐标")
+                    else:
+                        same = 0
+                    last_rect = list(rect)
+            b.bridge.act(hwnd, "scroll", target=at, amount=direction * amount)
+            steps += 1
+            time.sleep(0.045)
+        raise ToolError(
+            f"滚动 {max_steps} 步仍未看到 {target}",
+            advice="确认列表可滚动、元素在当前窗口；可加大 max_steps，或用 cu_show 重新定位")
+
+    def _to_point_in_window(self, to_hwnd, spec):
+        """Resolve drag.to element in another window and return @x,y."""
+        b = self._b()
+        try:
+            el, info = b.bridge.resolve(spec, int(to_hwnd))
+        except Exception as exc:
+            raise ToolError(
+                f"drag.to_window 里解析 to={spec!r} 失败：{exc}",
+                advice="先 cu_show 目标窗口拿 #id；或直接用 @x,y 坐标")
+        node = info.get("node") or getattr(el, "node", None) or {}
+        rect = node.get("rect")
+        if not rect or len(rect) < 4 or int(rect[2]) <= int(rect[0]) or int(rect[3]) <= int(rect[1]):
+            raise ToolError(f"drag.to_window 目标 {spec} 没有可见矩形，拒绝盲拖",
+                            advice="先 cu_show 确认目标元素可见")
+        win_rect = b.windows.get_rect(int(to_hwnd))
+        if not _rects_overlap(rect, win_rect):
+            raise ToolError(
+                f"drag.to_window 目标 {spec} 不在目标窗口 #{int(to_hwnd)} 可视区"
+                f"（rect={list(rect)}，窗口 rect={win_rect}）",
+                advice="在目标窗口先 scroll_until_visible，或让目标元素可见再拖")
+        cx = (int(rect[0]) + int(rect[2])) // 2
+        cy = (int(rect[1]) + int(rect[3])) // 2
+        return f"@{cx},{cy}"
 
     def _step_hwnd(self, step, *, activate, background=False):
         b = self._b()

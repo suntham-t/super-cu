@@ -193,6 +193,16 @@ img 1728x1080 (screen 2560x1600) 86KB — 用 @n:0.42,0.31 归一化坐标指位
 - `scroll` 可指定 `axis:"x"` 横向滚动；`drag` 可给 `path:["@x1,y1","@x2,y2"]` 走任意路径（此时 `to` 可省略）。
 - 这些字段只影响坐标/鼠标动作；语义动作（invoke/set/…）与最小化后台模式不受影响。
 
+### 跨窗口拖拽 / 滚动到元素（1.5.0）
+
+- 元素不在可视区（微信/Electron 自绘列表常见）：先 {"op":"scroll_until_visible","target":"#123","window":"#hwnd"}；
+  真实滚轮 + rect 判定，不依赖 UIA ScrollPattern。
+- 跨窗口拖放：{"op":"drag","target":"#file","to":"#composer","to_window":"#other","auto_scroll":true}；
+  to 在 to_window 里解析成元素中心，drop 后返回 drop_window=#.. pid=.. class=..。
+- 起点在窗口外 / 落点不在目标窗口会直接失败（不再静默 ok）；落点被别的窗口接走也会报错。
+- cu_show 现在按 rect 与窗口交集标 ~（屏幕外）；看到 ~ 不要点/拖，先 scroll_until_visible。
+- 内联状态不再固定等 150ms：只有看起来没变且这步是换视图类时才等一次重试。
+
 ## 6. 用 expect 验证（重要操作必做）
 
 `expect` = 动作后等待某段文本/元素名出现（最多 `timeout_ms`，默认 3000）：

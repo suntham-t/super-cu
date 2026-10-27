@@ -882,6 +882,43 @@ def _wheel(x: int, y: int, delta: int, horizontal: bool = False) -> None:
     _send_inputs([_mi(flag, int(delta))])
 
 
+def _point_in_rect(x: int, y: int, rect: Any) -> bool:
+    """True when (x,y) is inside [l,t,r,b] (pure, unit-tested)."""
+    if not rect or len(rect) < 4:
+        return False
+    return int(rect[0]) <= x < int(rect[2]) and int(rect[1]) <= y < int(rect[3])
+
+
+def _rects_intersect(a: Any, b: Any) -> bool:
+    """True when two [l,t,r,b] rectangles overlap (pure, unit-tested)."""
+    if not a or not b or len(a) < 4 or len(b) < 4:
+        return False
+    return (int(a[0]) < int(b[2]) and int(b[0]) < int(a[2])
+            and int(a[1]) < int(b[3]) and int(b[1]) < int(a[3]))
+
+
+def _window_at_point(x: int, y: int) -> tuple[int, int, str]:
+    """(root hwnd, pid, class) of the top-level window under a screen point."""
+    hwnd = 0
+    pid_value = 0
+    cls = ""
+    try:
+        pt = wt.POINT(int(x), int(y))
+        child = int(_user32.WindowFromPoint(pt) or 0)
+        root = int(_user32.GetAncestor(child, 2) or child) if child else 0
+        hwnd = root or child
+        if hwnd:
+            pid = wt.DWORD(0)
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            pid_value = int(pid.value)
+            buf = ctypes.create_unicode_buffer(256)
+            _user32.GetClassNameW(hwnd, buf, 256)
+            cls = buf.value
+    except Exception:
+        pass
+    return hwnd, pid_value, cls
+
+
 # --------------------------------------------------------------------------- #
 # clipboard (uiautomation already provides a working CF_UNICODETEXT bridge)
 # --------------------------------------------------------------------------- #
@@ -2309,6 +2346,7 @@ class Bridge:
         axis: str = "y",
         path: Any = None,
         modifiers: Any = None,
+        to_window: int | None = None,
         background: bool = False,
         **_ignored: Any,
     ) -> dict:
@@ -2404,6 +2442,7 @@ class Bridge:
                     hwnd, action, el, resolved, text, keys, value, amount, to,
                     ms=ms, button=button, hold_ms=hold_ms,
                     axis=axis, path=path, modifiers=modifiers,
+                    to_window=to_window,
                     background=background,
                 )
             if background:
@@ -2626,6 +2665,7 @@ class Bridge:
         axis: str = "y",
         path: Any = None,
         modifiers: Any = None,
+        to_window: int | None = None,
         background: bool = False,
     ) -> tuple[str, str, bool]:
         ctl = el.control if el is not None else None
@@ -2761,8 +2801,10 @@ class Bridge:
             return self._scroll(hwnd, el, resolved, amount, axis=axis, modifiers=modifiers)
 
         if action == "drag":
+            self._check_drag_source(hwnd, el, resolved)
             return self._drag(hwnd, el, resolved, to, hold_ms=hold_ms,
-                              path=path, modifiers=modifiers)
+                              path=path, modifiers=modifiers,
+                              to_window=to_window)
 
         raise BridgeError(f"不支持的动作: {action}")
 
@@ -3202,6 +3244,39 @@ class Bridge:
         extra = f" held={'+'.join(mods)}" if mods else ""
         return "click", f"滚轮 {ax} {n} 格 @({x},{y}){extra}", True
 
+    def _check_drag_source(self, hwnd: int, el: Element | None, resolved: dict) -> None:
+        """Fail before a drag whose start point is outside its window.
+
+        Off-screen list items (e.g. a scrolled-out WeChat file card) are still in
+        the UIA buffer; dragging from their stale rect clicks on the desktop and
+        silently does nothing.  Refuse with an actionable error instead.
+        """
+        if resolved.get("via") == "point":
+            x, y = resolved["point"]
+        elif el is not None:
+            rect = _rect_tuple(_prop(el.control, "BoundingRectangle", None))
+            if _area(rect) == 0:
+                rect = list(el.node.get("rect") or [0, 0, 0, 0])
+            if _area(rect) == 0:
+                return  # _fresh_center raises its own offscreen error
+            if _prop(el.control, "IsOffscreen", False):
+                # ScrollItemPattern may bring it into view; _fresh_center tries.
+                if self._pattern(el.control, "GetScrollItemPattern") is not None:
+                    return
+            x = (rect[0] + rect[2]) // 2
+            y = (rect[1] + rect[3]) // 2
+        else:
+            return
+        if not hwnd or not _win.is_window(hwnd):
+            return
+        win_rect = _win.get_rect(hwnd)
+        if _area(win_rect) == 0:
+            return
+        if not _point_in_rect(x, y, win_rect):
+            raise BridgeError(
+                f"drag 起点 ({x},{y}) 不在窗口 #{hwnd} 内（窗口 rect={win_rect}）；"
+                f"元素可能在可视区外，先 scroll_until_visible 或滚动后再拖")
+
     def _drag(
         self,
         hwnd: int,
@@ -3211,6 +3286,7 @@ class Bridge:
         hold_ms: int | None = None,
         path: Any = None,
         modifiers: Any = None,
+        to_window: int | None = None,
     ) -> tuple[str, str, bool]:
         """Drag from the start point to *to*, then verify the window followed.
 
@@ -3269,6 +3345,19 @@ class Bridge:
                 raise BridgeError("drag 需要 to 或 path")
             pts = drag_path(x, y, tx, ty)
         tx, ty = pts[-1]
+        if to_window is not None:
+            to_window = int(to_window)
+            if not _win.is_window(to_window):
+                raise BridgeError(f"drag 目标窗口 #{to_window} 不存在")
+            if _win.is_minimized(to_window):
+                raise BridgeError(
+                    f"drag 目标窗口 #{to_window} 最小化，无法接收 drop；"
+                    f"先 activate/还原目标窗口")
+            target_rect = _win.get_rect(to_window)
+            if not _point_in_rect(tx, ty, target_rect):
+                raise BridgeError(
+                    f"drag 落点 ({tx},{ty}) 不在目标窗口 #{to_window} "
+                    f"rect={target_rect} 内；用 to=#id（目标窗口里的元素）或修正坐标")
         self._ensure_focus(hwnd)
         _move_cursor(x, y)
         time.sleep(0.03)
@@ -3299,7 +3388,15 @@ class Bridge:
         _mouse("left", False)
         _mods_release(mods)
         time.sleep(0.08)
+        land_hwnd, land_pid, land_cls = _window_at_point(tx, ty)
+        if to_window is not None and land_hwnd and land_hwnd != int(to_window):
+            raise BridgeError(
+                f"drag 落点 ({tx},{ty}) 实际落在窗口 #{land_hwnd}（pid={land_pid} "
+                f"class={land_cls!r}），不是目标窗口 #{int(to_window)}；"
+                f"drop 被其他窗口接走（目标不在最前或坐标不准）")
         detail = f"拖动 ({x},{y}) -> ({tx},{ty})" + locals().get("detail_hold", "")
+        if land_hwnd:
+            detail += f" drop_window=#{land_hwnd} pid={land_pid} class={land_cls!r}"
         if custom_path:
             detail += f" path={len(pts)} pts"
         if mods:

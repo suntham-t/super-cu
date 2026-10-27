@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.5.0 — 2026-10-27
+
+### Added
+
+- scroll_until_visible：滚轮版滚到元素可见，覆盖微信/Electron 这类没有 ScrollPattern 的自绘列表；
+  按 rect 判定可见性，报告滚动步数，无进展时给建议后失败。
+- drag.to_window + drag.to:"#id"：跨窗口拖放，在目标窗口里解析元素中心作为落点；drag.auto_scroll
+  先把源元素滚进视口。全部可选，旧调用不变。
+
+### Fixed
+
+- drag 不再静默成功：起点在窗口外、落点不在目标窗口、drop 被其他窗口接走都会直接报错；
+  成功时 detail 带 drop_window=#hwnd pid=.. class=..。
+- cu_show 的 offscreen 改为 rect 与窗口交集判定（不再依赖 UIA IsOffscreen，微信消息列表里为 false）。
+
+### Changed
+
+- 内联状态不再固定等 150ms：先立即快照，只有看起来没变且步骤是换视图类（click/invoke/...）或失败时
+  才等 80-200ms 重试一次；快路径不再付固定税。
+
+### Tests
+
+- mock 协议套件 223/223、bridge 单元 27/27（开发自测）；真实套件结果本版不在此报告。
+
 ## 1.4.0 — 2026-10-27
 
 ### Added

@@ -223,7 +223,7 @@ def test_protocol():
         check("initialize capabilities.tools == {}",
               result.get("capabilities") == {"tools": {}})
         check("initialize serverInfo",
-              result.get("serverInfo") == {"name": "supercu", "version": "1.4.0"},
+              result.get("serverInfo") == {"name": "supercu", "version": "1.5.0"},
               str(result.get("serverInfo")))
 
         second = session.send("initialize", {})
@@ -1067,6 +1067,54 @@ def test_cua_parity():
 
 
 # --------------------------------------------------------------------------- #
+# 3d. 1.5.0: scroll_until_visible + cross-window drag (mock paths)
+# --------------------------------------------------------------------------- #
+def test_150_scroll_drag():
+    section("1.5.0 scroll_until_visible / cross-window drag (mock)")
+    session = Session(args=("--mock",))
+    try:
+        tools = session.send("tools/list")["result"]["tools"]
+        cu_do = [x for x in tools if x["name"] == "cu_do"][0]
+        props = cu_do["inputSchema"]["properties"]["steps"]["items"]["properties"]
+        check("1.5: scroll_until_visible in op enum",
+              "scroll_until_visible" in props["op"]["enum"])
+        check("1.5: to_window/auto_scroll/max_steps/at advertised",
+              all(k in props for k in ("to_window", "auto_scroll", "max_steps", "at")))
+        session.send("initialize", {"protocolVersion": "2024-11-05"})
+        session.notify("notifications/initialized")
+        show = session.call("cu_show", {"window": "#1001"})
+        match = re.search(r"\[(\d+)\]", text_of(show))
+        target = "#" + (match.group(1) if match else "1001")
+
+        res = session.call("cu_do", {"steps": [
+            {"op": "scroll_until_visible", "window": "#1001",
+             "target": target, "max_steps": 5}], "observe": "none"})
+        check("1.5: scroll_until_visible ok (mock)",
+              not is_error(res) and "ok" in text_of(res), text_of(res)[:140])
+
+        res = session.call("cu_do", {"steps": [
+            {"op": "drag", "target": target, "to": "@10,10",
+             "to_window": "#1001", "auto_scroll": True, "max_steps": 5}],
+            "observe": "none"})
+        check("1.5: drag to_window+auto_scroll ok (mock)",
+              not is_error(res) and "ok" in text_of(res), text_of(res)[:160])
+
+        for label, step in (
+            ("bad scroll_until target", {"op": "scroll_until_visible", "target": "@1,2"}),
+            ("bad max_steps", {"op": "scroll_until_visible", "target": target,
+                               "max_steps": 0}),
+            ("to_window on click", {"op": "click", "target": target,
+                                    "to_window": "#1001"}),
+        ):
+            res = session.call("cu_do", {"steps": [step]})
+            err = (res.get("error") or {})
+            check(f"1.5: {label} -> -32602", err.get("code") == -32602,
+                  str(err.get("message"))[:110])
+    finally:
+        session.close()
+
+
+# --------------------------------------------------------------------------- #
 # 3. in-process coordinate mapping + screenshot degradation
 # --------------------------------------------------------------------------- #
 def test_coordinates_inprocess():
@@ -1685,6 +1733,7 @@ def main(argv) -> int:
     test_protocol()
     test_background_mode()
     test_cua_parity()
+    test_150_scroll_drag()
     real_available = os.path.exists(os.path.join(SRC, "bridge.py"))
     if "--mock-only" not in argv and (real_available or "--real" in argv):
         test_prefetch_com_race()

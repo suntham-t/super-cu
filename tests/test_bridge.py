@@ -1990,6 +1990,13 @@ def t_cua_primitives_unit() -> str:
     assert captured.get("horizontal") is True, captured
     assert "滚轮 x 4" in detail, detail
     assert b._point_from_spec("@33,44") == (33, 44)
+    # pure geometry guards used by drag validation / offscreen marking
+    from bridge import _point_in_rect, _rects_intersect
+    assert _point_in_rect(5, 5, [0, 0, 10, 10])
+    assert not _point_in_rect(10, 5, [0, 0, 10, 10])
+    assert not _point_in_rect(5, 10, [0, 0, 10, 10])
+    assert _rects_intersect([0, 0, 10, 10], [5, 5, 15, 15])
+    assert not _rects_intersect([0, 0, 10, 10], [10, 10, 20, 20])
 
     # modifier + mouse ordering: keys down BEFORE the click, released AFTER it
     seq = []
@@ -2010,6 +2017,25 @@ def t_cua_primitives_unit() -> str:
     assert seq[-1] == ("release", ("ctrl", "shift")), seq
     return ("button back/forward→XBUTTON；modifiers 规范化；横向滚轮路由；"
             "drag path 点解析；修饰键按下/释放顺序正确")
+
+
+def t_drag_source_guard_unit() -> str:
+    """Drag from a point outside its window must fail before input injection."""
+    import bridge as BB
+    orig = (BB._win.is_window, BB._win.get_rect)
+    BB._win.is_window = lambda h: True
+    BB._win.get_rect = lambda h: [100, 100, 300, 300]
+    try:
+        try:
+            b._check_drag_source(4242, None, {"via": "point", "point": [50, 50]})
+        except BB.BridgeError as exc:
+            assert "不在窗口" in str(exc), str(exc)
+        else:
+            raise AssertionError("窗口外的拖拽起点没有被拒绝")
+        b._check_drag_source(4242, None, {"via": "point", "point": [150, 150]})
+    finally:
+        BB._win.is_window, BB._win.get_rect = orig
+    return "起点在窗口外 -> BridgeError；窗口内 -> 放行"
 
 
 # ---- real-window parity helpers ------------------------------------------- #
@@ -2229,6 +2255,7 @@ def main() -> int:
     check("14.4 memory caps (unit)", t_memory_caps_unit)
     check("14.5 background policy (unit)", t_background_policy_unit)
     check("14.6 CUA primitives (unit)", t_cua_primitives_unit)
+    check("14.7 drag source guard (unit)", t_drag_source_guard_unit)
     if "--unit-only" in sys.argv[1:]:
         # 纯单测模式：不碰桌面、不写剪贴板（Lead 正在用机器时用这个）
         passed = sum(1 for r in RESULTS if r[1])
