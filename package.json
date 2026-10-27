@@ -1,6 +1,6 @@
 {
   "name": "dsh-super-cu",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "private": true,
   "type": "module",
   "description": "DSH bundle for Windows desktop control over UI Automation: compact semantic snapshots with stable element ids (cu_show) and batched mouse, keyboard, window and wait/assert actions (cu_do).",
@@ -30,6 +30,7 @@
     "CHANGELOG.md",
     "docs/RESEARCH.md",
     "docs/MINIMIZED.md",
+    "docs/CUA-PARITY.md",
     "docs/OPTIMIZATION.md",
     "docs/OPT-BASELINE.md",
     "docs/OPT-AFTER.md",

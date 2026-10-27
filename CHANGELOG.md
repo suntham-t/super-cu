@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.4.0 — 2026-10-27
+
+### Added
+
+- **OpenAI CUA driver action-surface parity.** The nine computer-use driver actions documented by OpenAI
+  (screenshot / click / double_click / drag / keypress / move / scroll / type / wait, including button,
+  held keys, scroll_x/scroll_y and drag path) are now all expressible through `cu_do`:
+  - `click` gains `button`: left / right / middle (wheel) / back / forward (XBUTTON1/2);
+  - `scroll` gains `axis`: `x` (horizontal wheel / horizontal ScrollPattern) or `y`;
+  - `drag` gains `path`: an arbitrary list of coordinate waypoints (CUA `drag.path`), `to` becomes
+    optional when a path is given;
+  - pointer actions gain `modifiers` (ctrl/shift/alt/win) held while clicking/dragging/scrolling, the
+    equivalent of CUA `keys`.
+  All new fields are optional; existing calls and defaults are unchanged. Semantic actions, stable ids,
+  batched fail-fast, `expect` and minimized-window background mode are untouched.
+- `docs/CUA-PARITY.md` — action-by-action mapping, 2026 OpenAI architecture summary, benchmark caveats,
+  what we deliberately do not copy, and real-GUI verification results. `docs/RESEARCH.md` gains
+  §6 (OpenAI CUA) and updated references; SKILL/README document the new fields.
+
+### Tests
+
+- real bridge suite **57/57 PASS**, mock protocol suite **216/216 PASS**, bridge unit suite **26/26 PASS**,
+  py_compile clean.
+- New unit test 14.6: XBUTTON mapping, modifier normalization and press/release ordering, horizontal wheel
+  routing, drag-path point parsing. New mock suite section: CUA schema, valid combinations, invalid values
+  (-32602).
+- Real GUI: mouse back button navigated an Explorer window from `subdir` back to its parent; 4-waypoint
+  drag path on Notepad; middle click; ctrl+shift click; horizontal wheel.
+
 ## 1.3.1 — 2026-10-27
 
 ### Fixed

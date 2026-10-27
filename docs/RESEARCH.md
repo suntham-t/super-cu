@@ -88,3 +88,23 @@
 - trycua/cua（VM/容器化 computer-use 框架）：https://github.com/trycua/cua
 - UFO / WindowsAgentArena（UIA+视觉混合、多 agent 规划）：https://github.com/microsoft/UFO ；https://github.com/microsoft/WindowsAgentArena
 - 本机实测数据：`bench/baseline.json`（Windows-MCP 4.0.3，20 工具、Snapshot p50 32.5K 字符）、`bench/matrix.json`（super-cu 应用矩阵）。
+
+
+## 6. OpenAI CUA（2026 版文档，1.4.0 对齐）
+
+OpenAI 现在的 computer-use 有两条路径：**code-execution harness**（模型在持久桌面/浏览器里写 PyAutoGUI/Playwright）
+与 **Responses computer tool + 应用自带 driver**（9 个动作：screenshot / click / double_click / drag / keypress /
+move / scroll / type / wait；click 可带 button 与 keys，scroll 带 scroll_x/scroll_y，drag 带任意 path）。
+driver 由应用实现白名单/审批/步数上限，这一点与本插件的“语义驱动层”定位一致。
+
+1.4.0 已把**动作面 9/9 对齐**：点击侧键（back/forward）、横向滚动、任意路径拖拽、按住修饰键（等价于 CUA keys）；
+并且保留语义层增值（稳定 id、`#id`/`ct:名字` 目标、批量 fail-fast、`expect`/断言、最小化窗口后台操作）。
+模型级基准（OSWorld 38.1% / WebArena 58.1% / WebVoyager 87%，CUA 2025-01 发布）衡量的是模型看图决策能力，
+与工具层插件不可直接比较；工具层指标见 `docs/OPT-AFTER.md`。
+逐动作映射、真机验证与“刻意不照搬”清单见 `docs/CUA-PARITY.md`。
+
+## 7. 引用补充（OpenAI CUA）
+
+- OpenAI API 文档 Computer use：https://developers.openai.com/api/docs/guides/tools-computer-use
+- openai-python ComputerAction 类型：https://github.com/openai/openai-python/blob/main/src/openai/types/responses/computer_action.py
+- CUA / Operator（2025-01，含基准数字）：https://openai.com/index/computer-using-agent/

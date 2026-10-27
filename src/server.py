@@ -80,7 +80,7 @@ def _gui_lock():
     return _GUI_MOD
 
 SERVER_NAME = "supercu"
-SERVER_VERSION = "1.3.1"
+SERVER_VERSION = "1.4.0"
 DEFAULT_PROTOCOL = "2024-11-05"
 SHOT_MAX_LONG = 1728          # long side of the JPEG we hand to the client
 MAX_STEPS = 50
@@ -106,6 +106,10 @@ FOREGROUND_OPS = frozenset({"click", "dblclick", "rightclick", "hover", "focus",
                             "type", "key", "paste", "hold", "hold_mouse",
                             "scroll", "drag", "scroll_to", "launch", "activate"})
 MOUSE_BUTTONS = ("left", "right", "middle")
+#: CUA parity: a click can target any pointer button (wheel click = middle).
+CLICK_BUTTONS = ("left", "right", "middle", "back", "forward")
+MOD_NAMES = ("ctrl", "shift", "alt", "win")
+SCROLL_AXES = ("x", "y")
 ACT_MAP = {"set": "setvalue"}
 
 #: cu_do settle early-exit policy.  settle_ms is the requested wait after a
@@ -297,6 +301,43 @@ def _as_region(value):
     return [int(v) for v in value]
 
 
+def _as_modifiers(value):
+    """Modifiers held during a pointer action (the CUA keys field)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        chunks = value.replace("+", ",").split(",")
+    elif isinstance(value, list):
+        chunks = value
+    else:
+        raise RpcError(-32602, "modifiers 必须是字符串或字符串数组")
+    out = []
+    for chunk in chunks:
+        m = str(chunk).strip().lower()
+        if not m:
+            continue
+        m = {"control": "ctrl", "windows": "win", "cmd": "win", "meta": "win"}.get(m, m)
+        if m not in MOD_NAMES:
+            raise RpcError(-32602, f"modifiers 只支持 ctrl/shift/alt/win，收到 {chunk!r}")
+        if m not in out:
+            out.append(m)
+    return out or None
+
+
+def _as_path(value):
+    """Drag waypoints (the CUA drag.path field): list of coordinate strings."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise RpcError(-32602, "path 必须是非空字符串数组（拖拽路径点，如 ['@10,20','@30,40']）")
+    out = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise RpcError(-32602, "path 每项必须是坐标字符串（@x,y / @n:ux,uy / @img:x,y）")
+        out.append(item)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # backend loading (T1's windows.py + bridge.py, or the bundled mock)
 #
@@ -467,6 +508,8 @@ CU_DO = {
         "不还原窗口；也可显式 background:true 强制。click/key/paste/drag/scroll 必须先还原窗口。"
         "新增：clipboard(mode get|set)、window_move(x,y,w,h)、scroll_to(target)；"
         "drag 的 to 可直接写 #id / ct:名字。"
+        "兼容 OpenAI CUA 动作面：click 可指定 button(left/right/middle/back/forward)、"
+        "scroll 可用 axis=x 横向、drag 可给 path 路径点、指针动作可用 modifiers 按住 ctrl/shift/alt/win。"
     ),
     "inputSchema": {
         "type": "object",
@@ -516,8 +559,23 @@ CU_DO = {
                         },
                         "button": {
                             "type": "string",
-                            "enum": list(MOUSE_BUTTONS),
-                            "description": "hold_mouse 按住的鼠标键，默认 left",
+                            "enum": list(CLICK_BUTTONS),
+                            "description": "鼠标键：click 可用 left/right/middle(滚轮键)/back/forward；hold_mouse 仅 left/right/middle；默认 left",
+                        },
+                        "axis": {
+                            "type": "string",
+                            "enum": list(SCROLL_AXES),
+                            "description": "scroll 的滚动轴：y（默认，垂直）/ x（水平）",
+                        },
+                        "path": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "drag 的路径点列表（CUA drag.path，如 ['@100,200','@200,300']）；给 path 时 to 可省略",
+                        },
+                        "modifiers": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": list(MOD_NAMES)},
+                            "description": "按住这些修饰键执行本步的指针动作（click/dblclick/rightclick/hover/drag/scroll），CUA keys 的等价物",
                         },
                         "hold_ms": {
                             "type": "integer",
@@ -1181,13 +1239,32 @@ class SuperCuServer:
                         f'steps[{idx}].op="hold" 必须给 keys（如 "w" 或 "shift+w"）',
                     )
             if step.get("button") is not None:
-                if not isinstance(step.get("button"), str) or step["button"] not in MOUSE_BUTTONS:
+                btn = step.get("button")
+                allowed = MOUSE_BUTTONS if op == "hold_mouse" else CLICK_BUTTONS
+                if not isinstance(btn, str) or btn not in allowed:
                     raise RpcError(
                         -32602,
-                        f'steps[{idx}].button 只能是 {", ".join(MOUSE_BUTTONS)}',
+                        f'steps[{idx}].button 只能是 {", ".join(allowed)}',
                     )
             if op == "hold_mouse" and step.get("button") is None:
                 pass  # 默认 left
+            # CUA parity fields (validated here so a bad value is an RPC error,
+            # not a half-executed batch)
+            if step.get("axis") is not None:
+                if op != "scroll":
+                    raise RpcError(-32602, f"steps[{idx}].axis 只用于 scroll")
+                _as_enum(step, "axis", SCROLL_AXES, "y")
+            if step.get("path") is not None:
+                if op != "drag":
+                    raise RpcError(-32602, f"steps[{idx}].path 只用于 drag")
+                _as_path(step["path"])
+            if step.get("modifiers") is not None:
+                if op not in ("click", "dblclick", "rightclick", "hover", "drag", "scroll"):
+                    raise RpcError(
+                        -32602,
+                        f"steps[{idx}].modifiers 只用于指针动作"
+                        "（click/dblclick/rightclick/hover/drag/scroll）")
+                _as_modifiers(step["modifiers"])
             for key in ("amount", "timeout_ms", "hold_ms", "x", "y", "w", "h"):
                 value = step.get(key)
                 if value is not None and (isinstance(value, bool)
@@ -1423,15 +1500,22 @@ class SuperCuServer:
             to_spec = step.get("to")
             kwargs["to"] = (self._resolve_to_target(to_spec, hwnd)
                             if to_spec else None)
+            path_spec = _as_path(step.get("path"))
+            if path_spec:
+                kwargs["path"] = [self._to_point_spec(p) for p in path_spec]
             # Do NOT pass ``at`` here.  T1's verified direct call is
             # ``act(hwnd, "drag", target="@x,y", to="@x2,y2")``; adding ``at``
             # makes bridge.act take a different (point-only) branch and was the
             # only call-shape difference in the failing cu_do path.  The start
             # point is still the exact @x,y via resolve(target).
             kwargs["hold_ms"] = step.get("hold_ms")
+        elif op == "scroll":
+            kwargs["axis"] = _as_enum(step, "axis", SCROLL_AXES, "y")
         elif op in ("hold", "hold_mouse"):
             kwargs["ms"] = step.get("ms")
-            kwargs["button"] = step.get("button") or "left"
+            if op == "hold_mouse":
+                kwargs["button"] = _as_enum(step, "button", MOUSE_BUTTONS, "left")
+
         elif op == "launch":
             app = step.get("app") or step.get("text") or (
                 target if target and not str(target).startswith("#") else None)
@@ -1443,6 +1527,13 @@ class SuperCuServer:
                 hwnd = 0
         else:
             kwargs["app"] = step.get("app")
+        if op in ("click", "dblclick", "hover"):
+            if step.get("button") is not None:
+                kwargs["button"] = _as_enum(step, "button", CLICK_BUTTONS, "left")
+        if op in ("click", "dblclick", "rightclick", "hover", "drag", "scroll"):
+            mods = _as_modifiers(step.get("modifiers"))
+            if mods:
+                kwargs["modifiers"] = mods
         if background:
             kwargs["background"] = True
 

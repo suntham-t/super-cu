@@ -115,6 +115,17 @@ op 一览：
 - 细节/证据/复现：`docs/OPTIMIZATION.md`、`docs/OPT-AFTER.md`、`docs/OPT-VERIFY.md`；
   环境开关 `SUPER_CU_NO_CACHE` / `SUPER_CU_NO_PREFETCH` / `SUPER_CU_SETTLE_MIN_MS`。
 
+### 1.4 新增：OpenAI CUA 动作面对齐
+
+OpenAI 2026 版 computer-use driver 的 9 个动作（screenshot / click / double_click / drag / keypress / move /
+scroll / type / wait）现在都能通过 `cu_do` 表达，且保留语义层优势：
+
+- `click` 新增 `button`：`left/right/middle(滚轮键)/back/forward`（含 XBUTTON1/2）
+- `scroll` 新增 `axis`：`x`（横向滚轮/横向 ScrollPattern）/ `y`
+- `drag` 新增 `path`：任意路径点数组（CUA `drag.path`），给 path 时 `to` 可省略
+- 指针动作新增 `modifiers`：`ctrl/shift/alt/win` 按住执行（CUA `keys` 等价物）
+- 全部可选、默认行为不变；逐动作映射与真机验证见 [docs/CUA-PARITY.md](docs/CUA-PARITY.md)
+
 ### 1.3 新增：最小化窗口的后台操作
 
 - **最小化窗口可以直接执行 pattern 动作且不还原窗口**：`invoke / set / toggle / select / expand / collapse`

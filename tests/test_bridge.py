@@ -1781,13 +1781,19 @@ def t_com_after_prefetch_import() -> str:
         "done.wait(20)\n"
         "import bridge\n"
         "b = bridge.Bridge()\n"
-        "snap = b.snapshot(W.foreground_hwnd(), view='controls', max_nodes=40)\n"
+        "fg = W.foreground_hwnd() or next((w['hwnd'] for w in W.list_windows() if w['visible'] and w['title']), 0)\n"
+        "if not fg:\n"
+        "    print('NO_WINDOW')\n"
+        "    raise SystemExit(0)\n"
+        "snap = b.snapshot(fg, view='controls', max_nodes=40)\n"
         "print('OK total=%d shown=%d' % (snap['total'], snap['shown']))\n"
     )
     proc = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=120,
         env=dict(os.environ, PYTHONUTF8="1"))
     tail = ((proc.stdout or "") + (proc.stderr or ""))[-700:]
+    if proc.returncode == 0 and "NO_WINDOW" in (proc.stdout or ""):
+        return "SKIP: 当前没有可观察的前台/可见窗口（只验证了 import 不崩）"
     assert proc.returncode == 0, f"子进程 rc={proc.returncode}：{tail}"
     assert "OK total=" in (proc.stdout or ""), f"快照没有成功：{tail}"
     assert "CoInitialize" not in tail, f"出现 COM apartment 错误：{tail}"
@@ -1942,6 +1948,68 @@ def t_background_policy_unit() -> str:
                    "focus", "activate", "launch", "scroll_to"):
         assert denied not in B.BACKGROUND_SAFE_ACTIONS, f"{denied} 不应在后台白名单"
     return "click/key/paste/drag 在 background=true 下被拒绝并说明原因；白名单 12 项、黑名单 11 项"
+
+
+def t_cua_primitives_unit() -> str:
+    """CUA parity primitives: buttons, modifiers, horizontal scroll, drag path."""
+    from bridge import _button_event, _normalize_mods
+    assert _button_event("back", True) == (B.MOUSEEVENTF_XDOWN, B.XBUTTON1)
+    assert _button_event("back", False) == (B.MOUSEEVENTF_XUP, B.XBUTTON1)
+    assert _button_event("forward", True) == (B.MOUSEEVENTF_XDOWN, B.XBUTTON2)
+    assert _button_event("left", True) == (B.MOUSEEVENTF_LEFTDOWN, 0)
+    assert _button_event("left", False) == (B.MOUSEEVENTF_LEFTUP, 0)
+    assert _button_event("", True) == (B.MOUSEEVENTF_LEFTDOWN, 0)  # 空=默认左键
+    try:
+        _button_event("sideways", True)
+    except B.BridgeError:
+        pass
+    else:
+        raise AssertionError("未知鼠标键应报错")
+    assert _normalize_mods(None) == []
+    assert _normalize_mods("ctrl+shift") == ["ctrl", "shift"]
+    assert _normalize_mods(["Control", "win"]) == ["ctrl", "win"]
+    try:
+        _normalize_mods(["hyper"])
+    except B.BridgeError:
+        pass
+    else:
+        raise AssertionError("未知修饰键应报错")
+
+    captured = {}
+    orig_wheel = B._wheel
+    orig_focus = b._ensure_focus
+    B._wheel = lambda x, y, delta, horizontal=False: captured.update(
+        x=x, y=y, delta=delta, horizontal=horizontal)
+    b._ensure_focus = lambda hwnd: None
+    try:
+        _via, detail, _changed = b._scroll(
+            0, None, {"via": "point", "point": [11, 22]}, 4, axis="x")
+    finally:
+        B._wheel = orig_wheel
+        b._ensure_focus = orig_focus
+    assert captured.get("horizontal") is True, captured
+    assert "滚轮 x 4" in detail, detail
+    assert b._point_from_spec("@33,44") == (33, 44)
+
+    # modifier + mouse ordering: keys down BEFORE the click, released AFTER it
+    seq = []
+    orig = (B._mods_press, B._mods_release, B._mouse, B._move_cursor, b._ensure_focus)
+    B._mods_press = lambda mods: seq.append(("press", tuple(mods)))
+    B._mods_release = lambda mods: seq.append(("release", tuple(mods)))
+    B._mouse = lambda btn, down: seq.append(("mouse", btn, down))
+    B._move_cursor = lambda x, y: None
+    b._ensure_focus = lambda hwnd: None
+    try:
+        b._click_element(0, None, {"via": "point", "point": [5, 6]},
+                         button="middle", modifiers=["ctrl", "shift"])
+    finally:
+        (B._mods_press, B._mods_release, B._mouse, B._move_cursor,
+         b._ensure_focus) = orig
+    assert seq[0] == ("press", ("ctrl", "shift")), seq
+    assert ("mouse", "middle", True) in seq and ("mouse", "middle", False) in seq, seq
+    assert seq[-1] == ("release", ("ctrl", "shift")), seq
+    return ("button back/forward→XBUTTON；modifiers 规范化；横向滚轮路由；"
+            "drag path 点解析；修饰键按下/释放顺序正确")
 
 
 # ---- real-window parity helpers ------------------------------------------- #
@@ -2160,6 +2228,7 @@ def main() -> int:
     check("14.3 cache fallback (unit)", t_cache_fallback_unit)
     check("14.4 memory caps (unit)", t_memory_caps_unit)
     check("14.5 background policy (unit)", t_background_policy_unit)
+    check("14.6 CUA primitives (unit)", t_cua_primitives_unit)
     if "--unit-only" in sys.argv[1:]:
         # 纯单测模式：不碰桌面、不写剪贴板（Lead 正在用机器时用这个）
         passed = sum(1 for r in RESULTS if r[1])

@@ -223,7 +223,7 @@ def test_protocol():
         check("initialize capabilities.tools == {}",
               result.get("capabilities") == {"tools": {}})
         check("initialize serverInfo",
-              result.get("serverInfo") == {"name": "supercu", "version": "1.3.1"},
+              result.get("serverInfo") == {"name": "supercu", "version": "1.4.0"},
               str(result.get("serverInfo")))
 
         second = session.send("initialize", {})
@@ -1017,6 +1017,56 @@ def test_background_mode():
 
 
 # --------------------------------------------------------------------------- #
+# 3c. OpenAI CUA action-surface parity
+# --------------------------------------------------------------------------- #
+def test_cua_parity():
+    section("OpenAI CUA action-surface parity (mock)")
+    session = Session(args=("--mock",))
+    try:
+        tools = session.send("tools/list")["result"]["tools"]
+        cu_do = [x for x in tools if x["name"] == "cu_do"][0]
+        props = cu_do["inputSchema"]["properties"]["steps"]["items"]["properties"]
+        check("CUA: step schema advertises axis/path/modifiers",
+              all(k in props for k in ("axis", "path", "modifiers")))
+        check("CUA: click buttons include back/forward/wheel",
+              {"back", "forward", "middle"}.issubset(set(props["button"]["enum"])),
+              str(props["button"]["enum"]))
+        session.send("initialize", {"protocolVersion": "2024-11-05"})
+        session.notify("notifications/initialized")
+        show = session.call("cu_show", {"window": "#1001"})
+        show_text = text_of(show)
+        match = re.search(r"\[(\d+)\]", show_text)
+        target = "#" + (match.group(1) if match else "1001")
+
+        for label, step in (
+            ("click button=back", {"op": "click", "target": target, "button": "back"}),
+            ("click button=forward", {"op": "click", "target": target, "button": "forward"}),
+            ("scroll axis=x", {"op": "scroll", "target": target, "amount": 3, "axis": "x"}),
+            ("drag path", {"op": "drag", "target": target,
+                           "path": ["@10,20", "@30,40", "@50,60"]}),
+            ("click with modifiers", {"op": "click", "target": target,
+                                      "modifiers": ["ctrl", "shift"]}),
+        ):
+            res = session.call("cu_do", {"steps": [step], "observe": "none"})
+            check(f"CUA: {label} ok", not is_error(res) and "ok" in text_of(res),
+                  text_of(res)[:140])
+
+        bad_cases = (
+            ("button", {"op": "click", "target": target, "button": "sideways"}),
+            ("axis", {"op": "scroll", "target": target, "axis": "z"}),
+            ("modifiers", {"op": "click", "target": target, "modifiers": ["hyper"]}),
+            ("path", {"op": "drag", "target": target, "path": "@10,20"}),
+        )
+        for label, step in bad_cases:
+            res = session.call("cu_do", {"steps": [step]})
+            err = (res.get("error") or {})
+            check(f"CUA: bad {label} -> -32602", err.get("code") == -32602,
+                  str(err.get("message"))[:120])
+    finally:
+        session.close()
+
+
+# --------------------------------------------------------------------------- #
 # 3. in-process coordinate mapping + screenshot degradation
 # --------------------------------------------------------------------------- #
 def test_coordinates_inprocess():
@@ -1634,6 +1684,7 @@ def main(argv) -> int:
     test_settle_inprocess()
     test_protocol()
     test_background_mode()
+    test_cua_parity()
     real_available = os.path.exists(os.path.join(SRC, "bridge.py"))
     if "--mock-only" not in argv and (real_available or "--real" in argv):
         test_prefetch_com_race()

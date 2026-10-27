@@ -400,6 +400,12 @@ MOUSEEVENTF_ABSOLUTE = 0x8000
 MOUSEEVENTF_VIRTUALDESK = 0x4000
 MOUSEEVENTF_WHEEL = 0x0800
 MOUSEEVENTF_HWHEEL = 0x1000
+MOUSEEVENTF_XDOWN = 0x0080
+MOUSEEVENTF_XUP = 0x0100
+XBUTTON1 = 0x0001
+XBUTTON2 = 0x0002
+#: Mouse buttons a click can target (CUA parity: wheel click = middle).
+POINTER_BUTTONS = ("left", "right", "middle", "back", "forward")
 
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
@@ -517,6 +523,41 @@ def _kb(vk: int, up: bool = False, unicode: bool = False, scan: int = 0) -> _INP
         flags |= KEYEVENTF_UNICODE
         return _INPUT(type=_INPUT_KEYBOARD, u=_INPUTUNION(ki=_KEYBDINPUT(0, scan, flags, 0, 0)))
     return _INPUT(type=_INPUT_KEYBOARD, u=_INPUTUNION(ki=_KEYBDINPUT(vk, 0, flags, 0, 0)))
+
+
+def _normalize_mods(mods: Any) -> list[str]:
+    """Validate modifiers held during a pointer action (CUA keys field)."""
+    if not mods:
+        return []
+    if isinstance(mods, str):
+        chunks = mods.replace("+", ",").split(",")
+    elif isinstance(mods, (list, tuple, set)):
+        chunks = [str(m) for m in mods]
+    else:
+        raise BridgeError(f"modifiers 必须是字符串或字符串数组，收到 {mods!r}")
+    out: list[str] = []
+    for chunk in chunks:
+        m = str(chunk).strip().lower()
+        if not m:
+            continue
+        m = {"control": "ctrl", "windows": "win", "cmd": "win", "meta": "win"}.get(m, m)
+        if m not in _MOD_VK:
+            raise BridgeError(f"modifiers 只支持 ctrl/shift/alt/win，收到 {chunk!r}")
+        if m not in out:
+            out.append(m)
+    return [m for m in ("ctrl", "shift", "alt", "win") if m in out]
+
+
+def _mods_press(mods: list[str]) -> None:
+    for m in mods:
+        _send_inputs([_kb(_MOD_VK[m])])
+        time.sleep(0.012)
+
+
+def _mods_release(mods: list[str]) -> None:
+    for m in reversed(mods):
+        _send_inputs([_kb(_MOD_VK[m], up=True)])
+        time.sleep(0.008)
 
 
 def _mi(flags: int, data: int = 0, dx: int = 0, dy: int = 0) -> _INPUT:
@@ -814,14 +855,25 @@ def _move_cursor_abs(x: int, y: int) -> None:
         _user32.SetCursorPos(int(x), int(y))
 
 
-def _mouse(button: str, down: bool) -> None:
+def _button_event(button: str, down: bool) -> tuple[int, int]:
+    """(mouse flag, mouseData) for a button press/release (pure, unit-tested)."""
     table = {
-        "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
-        "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
-        "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+        "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 0),
+        "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 0),
+        "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, 0),
+        "back": (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON1),
+        "forward": (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON2),
     }
-    flag = table.get(button, table["left"])[0 if down else 1]
-    _send_inputs([_mi(flag)])
+    key = (button or "left").strip().lower()
+    if key not in table:
+        raise BridgeError(f"button 只支持 {'/'.join(POINTER_BUTTONS)}，收到 {button!r}")
+    down_flag, up_flag, data = table[key]
+    return down_flag if down else up_flag, data
+
+
+def _mouse(button: str, down: bool) -> None:
+    flag, data = _button_event(button, down)
+    _send_inputs([_mi(flag, data)])
 
 
 def _wheel(x: int, y: int, delta: int, horizontal: bool = False) -> None:
@@ -2254,6 +2306,9 @@ class Bridge:
         ms: int | None = None,
         button: str | None = None,
         hold_ms: int | None = None,
+        axis: str = "y",
+        path: Any = None,
+        modifiers: Any = None,
         background: bool = False,
         **_ignored: Any,
     ) -> dict:
@@ -2348,6 +2403,7 @@ class Bridge:
                 via, detail, changed = self._run_action(
                     hwnd, action, el, resolved, text, keys, value, amount, to,
                     ms=ms, button=button, hold_ms=hold_ms,
+                    axis=axis, path=path, modifiers=modifiers,
                     background=background,
                 )
             if background:
@@ -2567,6 +2623,9 @@ class Bridge:
         ms: int | None = None,
         button: str | None = None,
         hold_ms: int | None = None,
+        axis: str = "y",
+        path: Any = None,
+        modifiers: Any = None,
         background: bool = False,
     ) -> tuple[str, str, bool]:
         ctl = el.control if el is not None else None
@@ -2649,9 +2708,15 @@ class Bridge:
 
         if action in ("click", "dblclick", "rightclick", "hover"):
             clicks = 2 if action == "dblclick" else 1
-            button = "right" if action == "rightclick" else "left"
+            btn = (button or ("right" if action == "rightclick" else "left")).strip().lower()
+            if btn not in POINTER_BUTTONS:
+                raise BridgeError(
+                    f"button 只支持 {'/'.join(POINTER_BUTTONS)}，收到 {button!r}")
+            if action == "rightclick" and btn not in ("right", "left"):
+                raise BridgeError("rightclick 只使用右键；用 click + button 指定其他键")
             return self._click_element(
-                hwnd, el, resolved, clicks=clicks, button=button, hover=(action == "hover")
+                hwnd, el, resolved, clicks=clicks, button=btn,
+                hover=(action == "hover"), modifiers=modifiers,
             )
 
         if action == "type":
@@ -2693,10 +2758,11 @@ class Bridge:
             return self._scroll_into_view(ctl)
 
         if action == "scroll":
-            return self._scroll(hwnd, el, resolved, amount)
+            return self._scroll(hwnd, el, resolved, amount, axis=axis, modifiers=modifiers)
 
         if action == "drag":
-            return self._drag(hwnd, el, resolved, to, hold_ms=hold_ms)
+            return self._drag(hwnd, el, resolved, to, hold_ms=hold_ms,
+                              path=path, modifiers=modifiers)
 
         raise BridgeError(f"不支持的动作: {action}")
 
@@ -2783,6 +2849,7 @@ class Bridge:
         clicks: int = 1,
         button: str = "left",
         hover: bool = False,
+        modifiers: Any = None,
     ) -> tuple[str, str, bool]:
         if resolved.get("via") == "point":
             x, y = resolved["point"]
@@ -2790,19 +2857,30 @@ class Bridge:
             if el is None:
                 raise BridgeError("点击需要元素 target 或 at 坐标")
             x, y = self._fresh_center(el)
+        mods = _normalize_mods(modifiers)
         if hover:
-            _move_cursor(x, y)
-            return "click", f"移动到 ({x},{y})", False
+            _mods_press(mods)
+            try:
+                _move_cursor(x, y)
+            finally:
+                _mods_release(mods)
+            suffix = f" held={'+'.join(mods)}" if mods else ""
+            return "click", f"移动到 ({x},{y}){suffix}", False
         self._ensure_focus(hwnd)
         _move_cursor(x, y)
         time.sleep(0.012)
-        for i in range(max(1, clicks)):
-            _mouse(button, True)
-            time.sleep(0.008)
-            _mouse(button, False)
-            if i + 1 < clicks:
-                time.sleep(0.06)
-        return "click", f"{button} click x{clicks} @({x},{y})", True
+        _mods_press(mods)
+        try:
+            for i in range(max(1, clicks)):
+                _mouse(button, True)
+                time.sleep(0.008)
+                _mouse(button, False)
+                if i + 1 < clicks:
+                    time.sleep(0.06)
+        finally:
+            _mods_release(mods)
+        suffix = f" held={'+'.join(mods)}" if mods else ""
+        return "click", f"{button} click x{clicks} @({x},{y}){suffix}", True
 
     # -- value writing / typing -------------------------------------------- #
     def _read_back_value(self, ctl: Any) -> str | None:
@@ -3086,9 +3164,13 @@ class Bridge:
             return []
 
     def _scroll(
-        self, hwnd: int, el: Element | None, resolved: dict, amount: int
+        self, hwnd: int, el: Element | None, resolved: dict, amount: int,
+        axis: str = "y", modifiers: Any = None,
     ) -> tuple[str, str, bool]:
         n = int(amount) if amount else 3
+        ax = (axis or "y").strip().lower()
+        if ax not in ("x", "y"):
+            raise BridgeError(f"axis 只能是 x 或 y，收到 {axis!r}")
         if el is not None:
             pat = self._pattern(el.control, "GetScrollPattern")
             if pat is not None:
@@ -3096,11 +3178,11 @@ class Bridge:
                     step = auto.ScrollAmount.SmallIncrement
                     plain = auto.ScrollAmount.NoAmount
                     for _ in range(abs(n)):
-                        if n > 0:
-                            pat.Scroll(plain, step)
+                        if ax == "x":
+                            pat.Scroll(step if n > 0 else auto.ScrollAmount.SmallDecrement, plain)
                         else:
-                            pat.Scroll(plain, auto.ScrollAmount.SmallDecrement)
-                    return "scroll", f"ScrollPattern {n}", True
+                            pat.Scroll(plain, step if n > 0 else auto.ScrollAmount.SmallDecrement)
+                    return "scroll", f"ScrollPattern {ax} {n}", True
                 except Exception:
                     pass
         if resolved.get("via") == "point":
@@ -3111,8 +3193,14 @@ class Bridge:
             r = _win.get_rect(hwnd)
             x, y = (r[0] + r[2]) // 2, (r[1] + r[3]) // 2
         self._ensure_focus(hwnd)
-        _wheel(x, y, -120 * int(n))
-        return "click", f"滚轮 {n} 格 @({x},{y})", True
+        mods = _normalize_mods(modifiers)
+        _mods_press(mods)
+        try:
+            _wheel(x, y, -120 * int(n), horizontal=(ax == "x"))
+        finally:
+            _mods_release(mods)
+        extra = f" held={'+'.join(mods)}" if mods else ""
+        return "click", f"滚轮 {ax} {n} 格 @({x},{y}){extra}", True
 
     def _drag(
         self,
@@ -3121,6 +3209,8 @@ class Bridge:
         resolved: dict,
         to: str | None,
         hold_ms: int | None = None,
+        path: Any = None,
+        modifiers: Any = None,
     ) -> tuple[str, str, bool]:
         """Drag from the start point to *to*, then verify the window followed.
 
@@ -3130,15 +3220,19 @@ class Bridge:
         afterwards compare the cursor delta with the real window delta; if they
         disagree we fail loudly instead of reporting a silent success.
         """
-        if not to:
-            raise BridgeError("drag 需要 to 目标坐标")
-        tx, ty = self._point_or_element(to, hwnd)
+        if not to and not path:
+            raise BridgeError("drag 需要 to 或 path（CUA 路径）")
+        tx: int | None = None
+        ty: int | None = None
+        if to:
+            tx, ty = self._point_or_element(to, hwnd)
         if resolved.get("via") == "point":
             x, y = resolved["point"]
         elif el is not None:
             x, y = self._fresh_center(el)
         else:
             raise BridgeError("drag 需要 target 或 at")
+        start_x, start_y = x, y
         win_before = _win.get_rect(hwnd) if hwnd and _win.is_window(hwnd) else None
         caption = self._looks_like_caption(hwnd, x, y)
         restored = False
@@ -3151,14 +3245,35 @@ class Bridge:
             # intended cursor delta is preserved.
             nx = nr[0] + max(40, min((nr[2] - nr[0]) // 3, 300))
             ny = nr[1] + 12
-            tx += nx - x
-            ty += ny - y
+            if tx is not None and ty is not None:
+                tx += nx - x
+                ty += ny - y
             x, y = nx, ny
             win_before = nr
             restored = True
+        custom_path = False
+        if path:
+            raw_pts = path if isinstance(path, (list, tuple)) else [path]
+            pts = []
+            for spec in raw_pts:
+                if not isinstance(spec, str) or not spec.strip():
+                    raise BridgeError(f"drag path 每项必须是坐标字符串，收到 {spec!r}")
+                pts.append(self._point_from_spec(spec))
+            if not pts:
+                raise BridgeError("drag path 不能为空")
+            dxr, dyr = x - start_x, y - start_y
+            pts = [(px + dxr, py + dyr) for px, py in pts]
+            custom_path = True
+        else:
+            if tx is None or ty is None:
+                raise BridgeError("drag 需要 to 或 path")
+            pts = drag_path(x, y, tx, ty)
+        tx, ty = pts[-1]
         self._ensure_focus(hwnd)
         _move_cursor(x, y)
         time.sleep(0.03)
+        mods = _normalize_mods(modifiers)
+        _mods_press(mods)
         _mouse("left", True)
         time.sleep(0.06)
         if hold_ms:
@@ -3171,20 +3286,24 @@ class Bridge:
                 detail_hold = ""
         else:
             detail_hold = ""
-        path = drag_path(x, y, tx, ty)
-        for i, (px, py) in enumerate(path):
+        for i, (px, py) in enumerate(pts):
             # 标题栏拖动靠 Windows 的 modal move 循环：它只跟随真实光标位置，
             # SendInput 注入的绝对移动会让它把增量算成 0（实测窗口完全不动）。
             # 所以先 SetCursorPos（可靠驱动窗口移动）。
             _move_cursor(px, py)
-            if not caption and i + 1 < len(path):
+            if not caption and i + 1 < len(pts):
                 # 内容拖动（canvas/游戏/拖放）额外发真实 MOUSEMOVE，便于按帧读输入的 app
                 _move_cursor_abs(px, py)
             time.sleep(0.02)
         time.sleep(0.05)
         _mouse("left", False)
+        _mods_release(mods)
         time.sleep(0.08)
         detail = f"拖动 ({x},{y}) -> ({tx},{ty})" + locals().get("detail_hold", "")
+        if custom_path:
+            detail += f" path={len(pts)} pts"
+        if mods:
+            detail += f" held={'+'.join(mods)}"
         if not caption:
             # 内容拖动（选文本/滚动条/拖放/拖进输入框）：窗口本就不该跟动，只报事实
             detail += " drag content"
