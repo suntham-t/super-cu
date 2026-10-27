@@ -223,7 +223,7 @@ def test_protocol():
         check("initialize capabilities.tools == {}",
               result.get("capabilities") == {"tools": {}})
         check("initialize serverInfo",
-              result.get("serverInfo") == {"name": "supercu", "version": "1.2.0"},
+              result.get("serverInfo") == {"name": "supercu", "version": "1.3.0"},
               str(result.get("serverInfo")))
 
         second = session.send("initialize", {})
@@ -971,6 +971,52 @@ def test_compact():
 
 
 # --------------------------------------------------------------------------- #
+# 3b. minimized-window background mode (cu_do.background)
+# --------------------------------------------------------------------------- #
+def test_background_mode():
+    section("minimized window / background mode (mock)")
+    session = Session(args=("--mock",))
+    try:
+        tools = session.send("tools/list")["result"]["tools"]
+        cu_do = [t for t in tools if t["name"] == "cu_do"][0]
+        props = cu_do["inputSchema"]["properties"]
+        check("background flag advertised at batch level", "background" in props)
+        step_props = props["steps"]["items"]["properties"]
+        check("background flag advertised per step", "background" in step_props)
+        session.send("initialize", {"protocolVersion": "2024-11-05"})
+        session.notify("notifications/initialized")
+        show = session.call("cu_show", {"window": "#1001"})
+        show_text = text_of(show)
+        match = re.search(r"\[(\d+)\]", show_text)
+        target = "#" + (match.group(1) if match else "1001")
+        check("mock window yield a target id", bool(match), show_text.splitlines()[0][:60])
+
+        # 1) input-synthesis action with background=true must be rejected with advice
+        res = session.call("cu_do", {"steps": [
+            {"op": "click", "target": target, "background": True}]})
+        text = text_of(res)
+        check("background + click -> isError", is_error(res), text[:160])
+        check("background + click advice mentions pattern ops",
+              "pattern" in text and "background" in text, text[:160])
+
+        # 2) pattern action with background=true runs and reports the bg marker
+        res = session.call("cu_do", {"steps": [
+            {"op": "invoke", "target": target, "background": True}], "observe": "none"})
+        text = text_of(res)
+        check("background + invoke ok", not is_error(res) and "invoke" in text, text[:160])
+        check("background step line carries bg marker", " bg" in text, text[:160])
+
+        # 3) batch-level background default (step line still marked bg)
+        res = session.call("cu_do", {"background": True, "observe": "none", "steps": [
+            {"op": "invoke", "target": target}]})
+        text = text_of(res)
+        check("batch background applies to steps",
+              not is_error(res) and "ok invoke" in text and " bg" in text, text[:200])
+    finally:
+        session.close()
+
+
+# --------------------------------------------------------------------------- #
 # 3. in-process coordinate mapping + screenshot degradation
 # --------------------------------------------------------------------------- #
 def test_coordinates_inprocess():
@@ -1587,6 +1633,7 @@ def main(argv) -> int:
     test_lazy_backend_error_inprocess()
     test_settle_inprocess()
     test_protocol()
+    test_background_mode()
     real_available = os.path.exists(os.path.join(SRC, "bridge.py"))
     if "--mock-only" not in argv and (real_available or "--real" in argv):
         test_prefetch_com_race()

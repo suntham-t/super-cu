@@ -574,8 +574,11 @@ def t_uwp_relocate() -> str:
     eid = btn["id"]
     el = b.by_id(eid)
     assert el is not None, "by_id 拿不到缓存元素"
-    # 模拟 UWP 树重建：旧 control / RuntimeId 全失效，只剩语义信息
+    # 模拟 UWP 树重建：旧 control / RuntimeId / 缓存元素全失效，只剩语义信息
+    # （也必须清掉 cached_element：快路径元素若保留有效缓存指针，_materialize 会
+    #  把它当成 live，测试就测不到语义重定位了）
     el.control = None
+    el.cached_element = None
     el.rid = ("stale", 0)
     r = b.act(_calc_hwnd(), "invoke", target=f"#{eid}")
     ACTIONS.append(("invoke", bool(r["ok"])))
@@ -1920,6 +1923,27 @@ def t_memory_caps_unit() -> str:
             f"最近 id 可解析；窗口上限 3：_win_info/_win_ctl/_cache 均受限，by_id 不抛异常")
 
 
+def t_background_policy_unit() -> str:
+    """Background mode only accepts pattern actions; input synthesis is rejected."""
+    bridge = Bridge()
+    for action, kwargs, why in (
+        ("click", {"target": "@10,10"}, "click 需要坐标"),
+        ("key", {"keys": "enter"}, "key 需要前台"),
+        ("paste", {"text": "x"}, "paste 需要前台"),
+        ("drag", {"target": "@10,10", "to": "@20,20"}, "drag 需要坐标"),
+    ):
+        res = bridge.act(0, action, background=True, **kwargs)
+        assert res["ok"] is False, f"{action}: 应为失败: {res}"
+        assert "后台模式" in res["detail"], f"{action}: 错误应说明后台模式: {res['detail']}"
+    for allowed in ("invoke", "toggle", "select", "expand", "collapse", "setvalue",
+                    "close", "minimize", "maximize", "restore", "wait", "assert"):
+        assert allowed in B.BACKGROUND_SAFE_ACTIONS, f"{allowed} 应在后台白名单"
+    for denied in ("click", "key", "type", "paste", "drag", "scroll", "hover",
+                   "focus", "activate", "launch", "scroll_to"):
+        assert denied not in B.BACKGROUND_SAFE_ACTIONS, f"{denied} 不应在后台白名单"
+    return "click/key/paste/drag 在 background=true 下被拒绝并说明原因；白名单 12 项、黑名单 11 项"
+
+
 # ---- real-window parity helpers ------------------------------------------- #
 def _snap_pair(hwnd: int, *, view: str = "controls", max_nodes: int = 200):
     """(legacy, cached) snapshots from two fresh Bridges (identical id spaces)."""
@@ -2135,6 +2159,7 @@ def main() -> int:
     check("14.2 cache switch (unit)", t_cache_switch_unit)
     check("14.3 cache fallback (unit)", t_cache_fallback_unit)
     check("14.4 memory caps (unit)", t_memory_caps_unit)
+    check("14.5 background policy (unit)", t_background_policy_unit)
     if "--unit-only" in sys.argv[1:]:
         # 纯单测模式：不碰桌面、不写剪贴板（Lead 正在用机器时用这个）
         passed = sum(1 for r in RESULTS if r[1])

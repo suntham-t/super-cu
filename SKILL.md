@@ -171,6 +171,15 @@ img 1728x1080 (screen 2560x1600) 86KB — 用 @n:0.42,0.31 归一化坐标指位
 
 写不出来时优先拆成 `click`/`set`，别硬猜键名；报 `unknown_key` 时按表改写法。
 
+### 最小化窗口 / 后台模式（1.3.0）
+
+- 最小化窗口上 `invoke / set / toggle / select / expand / collapse` 默认自动**后台执行**（不还原窗口），步骤行带 ` bg`；
+  也可显式 `background:true`（步骤或整批），单步 `background:false` 覆盖。
+- `click / key / paste / drag / scroll / type` 必须真实前台：给 `background:true` 会直接报错（附改写建议），
+  去掉 `background` 插件会先 `activate` 还原窗口再执行。
+- `cu_show` 窗口行带 `min` 标记；最小化窗口的 rect 不可用于坐标。应用是否暴露子树不同：
+  微信最小化可操作（但会标 `focus_stolen`），Win11 记事本最小化需先 `activate`。
+
 ## 6. 用 expect 验证（重要操作必做）
 
 `expect` = 动作后等待某段文本/元素名出现（最多 `timeout_ms`，默认 3000）：

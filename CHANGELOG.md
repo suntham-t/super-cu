@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.3.0 — 2026-10-27
+
+### Added
+
+- **Minimized-window background actions.** `cu_do` can now run pure UIA-pattern actions
+  (`invoke` / `set` / `toggle` / `select` / `expand` / `collapse`) on a **minimized**
+  window **without restoring it**. Pattern steps on a minimized window switch to background mode
+  automatically; explicit control via per-step `background: true|false` or batch-level
+  `{"background": true, "steps": [...]}`. Input-synthesis actions (`click` / `dblclick` /
+  `rightclick` / `hover` / `drag` / `scroll` / `type` / `key` / `paste` / `focus`) are
+  rejected in background mode with rewrite advice in 0 ms instead of silently stealing focus.
+- `cu_show` window headers now carry `min` / `max`; snapshots expose `minimized` /
+  `maximized` (the presentation layer already knew how to render them).
+- `bridge.act(background=True)` restricts itself to the pattern whitelist (no click fallback, no
+  focus/clipboard fallback for `setvalue`) and reports `focus_stolen` when the target app's own
+  UIA provider grabs the foreground — WeChat does this even while minimized.
+- `docs/MINIMIZED.md` — capability matrix, usage, per-app findings.
+
+### Changed
+
+- `cu_do` step lines gain `bg` / `focus_stolen` markers; the step schema advertises
+  `background`; a batch-level `background` option is new.
+- `tests/test_bridge.py`: new background-policy unit test; the UWP relocate test now also clears
+  `cached_element` so it really exercises semantic relocation (it could pass through the cache
+  fast path by accident before).
+
+### Tests
+
+- real bridge suite 56/56 PASS, mock protocol suite 205/205 PASS, bridge unit suite 25/25 PASS,
+  py_compile clean. New unit/route coverage: background policy whitelist, background step marker,
+  batch-level background, background + input-synthesis rejection.
+
+### Notes
+
+- Minimized windows report an icon-position rect (`-31991,-32000` style): never derive coordinates
+  from it.
+- Background pattern actions need neither the foreground nor the shared desktop lock, so they do not
+  disturb another agent/session using the desktop.
+- Application-dependent: Windows 11 Notepad does not expose its document tree while minimized
+  (restore first); WeChat exposes the full tree and accepts value/invoke in background.
+
 ## 1.2.0 — 2026-10-27
 
 Performance round: snapshot fast path over UIA cache requests, lazy startup with after-handshake

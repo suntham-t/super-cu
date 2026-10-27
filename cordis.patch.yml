@@ -23,6 +23,6 @@
         env:
           PYTHONUTF8: '1'
           PYTHONIOENCODING: 'utf-8'
-          SUPER_CU_BUILD: '3'
+          SUPER_CU_BUILD: '4'
         # A broken GUI tool must never brick the user's session.
         failOnStartupError: false

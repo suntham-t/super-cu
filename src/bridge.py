@@ -152,6 +152,17 @@ _CLICKISH = frozenset(
     {"invoke", "toggle", "select", "click", "dblclick", "rightclick", "expand", "collapse", "hover"}
 )
 
+#: Actions that can run without real foreground focus or screen coordinates:
+#: pure UIA patterns (invoke / set / toggle / select / expand / collapse) plus
+#: window manipulation handled earlier in Bridge.act.  With background=True
+#: these execute on a minimized window WITHOUT restoring it; input synthesis
+#: (click / key / type / paste / drag / scroll / hover / focus) inherently needs
+#: the real foreground, so it is rejected instead of silently stealing focus.
+BACKGROUND_SAFE_ACTIONS = frozenset({
+    "invoke", "toggle", "select", "expand", "collapse", "setvalue",
+    "close", "minimize", "maximize", "restore", "wait", "assert",
+})
+
 
 # --------------------------------------------------------------------------- #
 # errors
@@ -1892,6 +1903,8 @@ class Bridge:
             "title": info["title"],
             "rect": info["rect"],
             "focused": info["focused"],
+            "minimized": bool(info.get("minimized")),
+            "maximized": bool(_win.is_maximized(hwnd)),
             "proc": info["proc"],
             "space": "physical",
             "view": view,
@@ -2241,6 +2254,7 @@ class Bridge:
         ms: int | None = None,
         button: str | None = None,
         hold_ms: int | None = None,
+        background: bool = False,
         **_ignored: Any,
     ) -> dict:
         t0 = time.perf_counter()
@@ -2248,12 +2262,25 @@ class Bridge:
         if not action:
             raise BridgeError("action 为空")
         hwnd = int(hwnd or 0)
+        background = bool(background)
         self.space_check()
         self._last_verified = None
         result = {"ok": False, "action": action, "via": None, "ms": 0, "detail": "", "changed": False}
         rehomed = 0
 
         try:
+            if background and action not in BACKGROUND_SAFE_ACTIONS:
+                raise BridgeError(
+                    f"后台模式（background=true）不支持动作 {action}：它需要真实前台焦点或屏幕坐标。"
+                    "改用 pattern 动作（invoke / set / toggle / select / expand / collapse），"
+                    "或去掉 background，让插件先还原窗口再操作"
+                )
+            fg_before = None
+            if background:
+                try:
+                    fg_before = _win.foreground_hwnd()
+                except Exception:
+                    fg_before = None
             # A UWP (ApplicationFrameHost) window can be re-created with a new
             # hwnd while ids/actions are in flight: relocate before failing.
             if hwnd and not _win.is_window(hwnd):
@@ -2321,7 +2348,19 @@ class Bridge:
                 via, detail, changed = self._run_action(
                     hwnd, action, el, resolved, text, keys, value, amount, to,
                     ms=ms, button=button, hold_ms=hold_ms,
+                    background=background,
                 )
+            if background:
+                result["background"] = True
+                try:
+                    fg_after = _win.foreground_hwnd()
+                except Exception:
+                    fg_after = fg_before
+                if (fg_before and fg_after and fg_after != fg_before
+                        and hwnd and int(fg_after) == int(hwnd)):
+                    result["focus_stolen"] = True
+                    detail += (" focus_stolen（该应用的 UIA 提供者自己抢了前台；"
+                               "窗口未还原，键盘焦点可能已切走）")
             if resolved.get("relocated"):
                 detail = f"{detail} {resolved['relocated']}"
             if rehomed:
@@ -2528,6 +2567,7 @@ class Bridge:
         ms: int | None = None,
         button: str | None = None,
         hold_ms: int | None = None,
+        background: bool = False,
     ) -> tuple[str, str, bool]:
         ctl = el.control if el is not None else None
         label = self._el_label(el, resolved)
@@ -2549,6 +2589,11 @@ class Bridge:
             if pat is not None:
                 pat.Toggle()
                 return "toggle", "TogglePattern", True
+            if background:
+                raise BridgeError(
+                    f"元素 {label} 不支持 TogglePattern（后台模式禁止 click 回退）："
+                    "去掉 background 让插件还原窗口后点击，或换一个可操作目标"
+                )
             return (
                 self._click_element(hwnd, el, resolved, clicks=1)[0],
                 f"click 回退（toggle pattern_unavailable）",
@@ -2560,6 +2605,11 @@ class Bridge:
             if pat is not None:
                 pat.Select()
                 return "select", "SelectionItemPattern", True
+            if background:
+                raise BridgeError(
+                    f"元素 {label} 不支持 SelectionItemPattern（后台模式禁止 click 回退）："
+                    "去掉 background 让插件还原窗口后点击，或换一个可操作目标"
+                )
             return (
                 self._click_element(hwnd, el, resolved, clicks=1)[0],
                 "click 回退（select pattern_unavailable）",
@@ -2574,6 +2624,11 @@ class Bridge:
                 else:
                     pat.Collapse()
                 return action, f"ExpandCollapsePattern.{action.capitalize()}", True
+            if background:
+                raise BridgeError(
+                    f"元素 {label} 不支持 ExpandCollapsePattern（后台模式禁止 click 回退）："
+                    "去掉 background 让插件还原窗口后点击，或换一个可操作目标"
+                )
             return (
                 self._click_element(hwnd, el, resolved, clicks=1)[0],
                 f"click 回退（{action} pattern_unavailable）",
@@ -2590,7 +2645,7 @@ class Bridge:
             if ctl is None:
                 raise BridgeError("setvalue 需要元素 target")
             new = value if value is not None else (text or "")
-            return self._set_value(ctl, new)
+            return self._set_value(ctl, new, background=background)
 
         if action in ("click", "dblclick", "rightclick", "hover"):
             clicks = 2 if action == "dblclick" else 1
@@ -2808,14 +2863,18 @@ class Bridge:
                 time.sleep(0.02 + random.random() * 0.02)  # 20-40ms jitter
         return len([p for p in plan if p is not None])
 
-    def _set_value(self, ctl: Any, new: str) -> tuple[str, str, bool]:
+    def _set_value(self, ctl: Any, new: str, *, background: bool = False) -> tuple[str, str, bool]:
         new = new or ""
         pat = self._pattern(ctl, "GetValuePattern")
         if pat is not None:
             try:
                 pat.SetValue(new)
             except Exception:
-                pass
+                if background:
+                    raise BridgeError(
+                        "该控件不支持后台 ValuePattern.SetValue（后台模式禁止焦点回退）："
+                        "去掉 background 让插件先还原窗口再写入，或改用 click + paste"
+                    )
             else:
                 verified = self._verify(ctl, new)
                 if verified is False:
@@ -2828,6 +2887,11 @@ class Bridge:
                 self._last_verified = verified
                 suffix = "verified" if verified else "（该控件不支持回读）"
                 return "setvalue", f"ValuePattern.SetValue({len(new)} chars) {suffix}", True
+        if background:
+            raise BridgeError(
+                "该控件没有可用的 ValuePattern，后台模式无法写入："
+                "去掉 background（会先还原窗口）或改用 click + paste"
+            )
         # fallback: focus + Ctrl+A + paste/typing (needs the desktop lock)
         with self._locked():
             try:

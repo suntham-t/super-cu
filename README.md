@@ -115,6 +115,17 @@ op 一览：
 - 细节/证据/复现：`docs/OPTIMIZATION.md`、`docs/OPT-AFTER.md`、`docs/OPT-VERIFY.md`；
   环境开关 `SUPER_CU_NO_CACHE` / `SUPER_CU_NO_PREFETCH` / `SUPER_CU_SETTLE_MIN_MS`。
 
+### 1.3 新增：最小化窗口的后台操作
+
+- **最小化窗口可以直接执行 pattern 动作且不还原窗口**：`invoke / set / toggle / select / expand / collapse`
+  在最小化窗口上自动走后台模式，步骤行带 `bg`；也可显式 `background:true`（步骤或整批），单步
+  `background:false` 覆盖回前台。
+- **输入合成动作仍必须还原窗口**：`click / key / paste / drag / scroll / type` 给 `background:true` 会
+  0ms 报错并提示改写，而不是静默抢焦点/还原窗口。
+- `cu_show` 窗口行新增 `min` / `max` 标记；最小化窗口的 rect 是图标位置，不能拿来算坐标。
+- 应用差异：微信最小化后 UIA 树完整、可后台 `invoke`/`set`（会标 `focus_stolen`，因为微信自己会抢前台）；
+  Win11 记事本最小化后内容树不暴露，需要先 `activate`。详见 `docs/MINIMIZED.md`。
+
 ## 安装
 
 **要求**：Windows 10/11、Python 3.11+、DSH `>= 0.2`。

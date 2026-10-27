@@ -80,7 +80,7 @@ def _gui_lock():
     return _GUI_MOD
 
 SERVER_NAME = "supercu"
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
 DEFAULT_PROTOCOL = "2024-11-05"
 SHOT_MAX_LONG = 1728          # long side of the JPEG we hand to the client
 MAX_STEPS = 50
@@ -96,6 +96,15 @@ OPS = ("click", "dblclick", "rightclick", "hover", "focus", "set", "type",
        "window_move")
 HOLD_MIN_MS = 20
 HOLD_MAX_MS = 10000
+#: cu_do ops that may run in background (no restore / no foreground focus).
+#: Pure UIA patterns + window manipulation; input synthesis cannot.
+BACKGROUND_OPS = frozenset({"invoke", "toggle", "select", "expand", "collapse",
+                            "set", "wait", "assert", "clipboard",
+                            "minimize", "maximize", "close"})
+#: Ops that inherently need real foreground focus or screen coordinates.
+FOREGROUND_OPS = frozenset({"click", "dblclick", "rightclick", "hover", "focus",
+                            "type", "key", "paste", "hold", "hold_mouse",
+                            "scroll", "drag", "scroll_to", "launch", "activate"})
 MOUSE_BUTTONS = ("left", "right", "middle")
 ACT_MAP = {"set": "setvalue"}
 
@@ -210,6 +219,13 @@ def _advice_for(detail: str) -> str:
     if "对话框" in low or "dialog" in low or "阻塞" in low or "blocked" in low:
         return ("有阻塞对话框挡着：先用 op=key keys=\"alt+n\"（不保存）或 enter "
                 "处理它，再重试；也可以用 cu_show scope=desktop 找到对话框 #hwnd")
+    if "后台模式" in low or "background" in low:
+        return ("该动作需要真实前台焦点或屏幕坐标，后台模式（最小化窗口）不支持："
+                "改用 invoke/set/toggle/select/expand/collapse 等 pattern 动作；"
+                "或去掉 background，让插件先还原窗口再操作")
+    if "最小化" in low or "minimized" in low:
+        return ("窗口最小化时部分应用的 UIA 子控件不暴露：先 activate 还原窗口再操作，"
+                "或只用 pattern 动作 + background")
     if "歧义" in low or "ambiguous" in low or "候选" in low:
         return "target 命中了多个元素：改用 #id，或写全名 ct:完整名字"
     if "窗口" in low and ("关闭" in low or "没有" in low or "不存在" in low):
@@ -447,6 +463,8 @@ CU_DO = {
         "目标窗口不在前台会自动激活，无需单列 activate。"
         "发送/删除/支付等不可逆动作先用 expect 验证上一步结果。"
         "observe=auto 仅在有界面变化或失败时回传最新界面。"
+        "最小化窗口：pattern 动作（invoke/set/toggle/select/expand/collapse）会自动走后台模式、"
+        "不还原窗口；也可显式 background:true 强制。click/key/paste/drag/scroll 必须先还原窗口。"
         "新增：clipboard(mode get|set)、window_move(x,y,w,h)、scroll_to(target)；"
         "drag 的 to 可直接写 #id / ct:名字。"
     ),
@@ -460,6 +478,10 @@ CU_DO = {
                     "type": "object",
                     "properties": {
                         "op": {"type": "string", "enum": list(OPS)},
+                        "background": {
+                            "type": "boolean",
+                            "description": "该步强制后台模式：不还原/不抢前台，只对 pattern 动作有效（invoke/set/toggle/select/expand/collapse 等）；最小化窗口默认自动后台。输入合成类动作给 true 会报错",
+                        },
                         "target": {"type": "string",
                                    "description": "#id | ct:名字 | @n:ux,uy | @img:x,y | @x,y"},
                         "wait_kind": {
@@ -511,6 +533,11 @@ CU_DO = {
                     "required": ["op"],
                 },
             },
+            "background": {
+                "type": "boolean",
+                "default": False,
+                "description": "整批动作的后台模式默认值：不还原/不抢前台，只对 pattern 动作有效；单步 background 可覆盖",
+            },
             "observe": {"type": "string", "enum": ["auto", "none", "state"],
                         "default": "auto",
                         "description": "auto=只在中途失败或末步可能改变界面时附带最新状态"},
@@ -536,6 +563,8 @@ class SuperCuServer:
         self.last_shot = None          # normalized shot meta for @n / @img
         self.last_crop = None          # compact.format_snapshot crop stats
         self._prefetch_started = False
+        self._batch_background = False
+        self._background_effective = False
         self._init_backend(force_mock)
 
     # -- setup ------------------------------------------------------------- #
@@ -1168,6 +1197,7 @@ class SuperCuServer:
         observe = _as_enum(args, "observe", ("auto", "none", "state"), "auto")
         want_shot = _as_bool(args, "screenshot", False)
         settle_ms = _as_int(args, "settle_ms", 120, 0, 2000)
+        self._batch_background = _as_bool(args, "background", False)
 
         lines: list = []
         failed = None
@@ -1220,6 +1250,10 @@ class SuperCuServer:
                                 "timeout_ms；expect 匹配元素名/文本")
                             break
                         extra = (extra + " exp✓").strip()
+                    if res.get("background"):
+                        extra = (extra + " bg").strip()
+                    if res.get("focus_stolen"):
+                        extra = (extra + " focus_stolen").strip()
                     lines.append(compact.step_ok(idx, label,
                                                  res.get("via") or "-",
                                                  res.get("ms", 0), extra))
@@ -1334,6 +1368,14 @@ class SuperCuServer:
                     "detail": res.get("detail") or ("已满足" if ok else "超时未满足"),
                     "changed": False, "hwnd": hwnd}
 
+        explicit_bg = step.get("background")
+        background = (self._batch_background if explicit_bg is None
+                      else bool(explicit_bg))
+        if background and op in FOREGROUND_OPS:
+            raise ToolError(
+                f'op="{op}" 需要真实前台焦点或屏幕坐标，不能用 background（后台模式）',
+                advice="改用 pattern 动作（invoke / set / toggle / select / expand / collapse），"
+                       "或去掉 background，让插件先还原窗口再操作")
         activate = op not in ("launch", "close", "minimize", "maximize",
                               "scroll_to")
         if (op in ("key", "paste") and not step.get("window")
@@ -1349,7 +1391,8 @@ class SuperCuServer:
                 self.last_hwnd = hwnd
             activate = False
         else:
-            hwnd = self._step_hwnd(step, activate=activate)
+            hwnd = self._step_hwnd(step, activate=activate, background=background)
+            background = self._background_effective
         target = step.get("target")
         if target:
             target = self._to_point_spec(target)
@@ -1393,6 +1436,8 @@ class SuperCuServer:
                 hwnd = 0
         else:
             kwargs["app"] = step.get("app")
+        if background:
+            kwargs["background"] = True
 
         if os.environ.get("SUPER_CU_DEBUG_DRAG") and op == "drag":
             # diagnosis switch only: never appears in protocol output
@@ -1416,6 +1461,10 @@ class SuperCuServer:
             "changed": bool(res.get("changed")),
             "hwnd": hwnd,
         }
+        if background or res.get("background"):
+            out["background"] = True
+        if res.get("focus_stolen"):
+            out["focus_stolen"] = True
         if out["ok"] and op == "launch":
             app_name = step.get("app") or step.get("text")
             found_hwnd = self._launched_hwnd(b, before_hwnds, app_name)
@@ -1594,8 +1643,9 @@ class SuperCuServer:
             return f"@{cx},{cy}"
         return s
 
-    def _step_hwnd(self, step, *, activate):
+    def _step_hwnd(self, step, *, activate, background=False):
         b = self._b()
+        self._background_effective = False
         spec = step.get("window")
         if step.get("app") and step["op"] != "launch":
             spec = spec or step["app"]
@@ -1616,6 +1666,20 @@ class SuperCuServer:
                 advice='给 step.window（标题/#hwnd），或先 cu_show 确认前台窗口')
         hwnd = int(hwnd)
         self.last_hwnd = hwnd
+        if background:
+            activate = False
+        elif activate and step.get("op") in BACKGROUND_OPS:
+            # Minimized windows: pattern actions run in background by default so
+            # the window is never restored/focused just to read a value.
+            try:
+                minimized = bool(b.windows.is_minimized(hwnd))
+            except Exception:
+                minimized = False
+            if minimized:
+                background = True
+                activate = False
+                log(f"cu_do auto-background hwnd={hwnd} op={step.get('op')} (minimized)")
+        self._background_effective = background
         if activate:
             try:
                 if int(b.windows.foreground_hwnd() or 0) != hwnd:
