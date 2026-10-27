@@ -18,13 +18,11 @@ Implements CONTRACT.md §4/§5:
 """
 from __future__ import annotations
 
-import base64
 import contextlib
 import json
 import os
 import sys
 import time
-import traceback
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -32,24 +30,57 @@ if _HERE not in sys.path:
 
 import compact  # noqa: E402  (pure presentation layer, imported after sys.path fix)
 
-try:  # dpi.py is lead-owned; never crash if it is missing during bring-up
-    from dpi import ensure_dpi_aware  # noqa: E402
-except Exception:  # pragma: no cover
-    def ensure_dpi_aware():  # type: ignore
-        return {"ok": False, "error": "dpi.py missing"}
+# Startup imports stay at the stdlib minimum: initialize/tools-list are pure
+# constants and must answer while the process is still cold.  The heavy pairs
+# are imported on first use only:
+#   * bridge.py   -> uiautomation/comtypes (~300ms) + Pillow (~40-200ms)
+#   * windows.py  -> ctypes + dpi.py (~100ms)              (first tool call)
+#   * gui_lock.py -> pathlib (~30ms)                       (first desktop action)
+#   * base64 (~20ms) / traceback (~25ms)                   (screenshot / errors)
+def _b64(data: bytes) -> str:
+    """base64 an image payload (import deferred: only screenshots need it)."""
+    import base64
+    return base64.b64encode(data).decode("ascii")
 
-try:
-    from gui_lock import gui_locked, GuiBusy  # noqa: E402
-except Exception:  # pragma: no cover
-    class GuiBusy(Exception):
-        pass
 
-    @contextlib.contextmanager
-    def gui_locked(timeout_s=30.0, poll_s=0.05):
-        yield
+def _tb() -> str:
+    """One-line traceback for stderr logs (import deferred: error path only)."""
+    import traceback
+    return traceback.format_exc().replace("\n", " | ")
+
+
+# --- GUI mutex (src/gui_lock.py, Lead-owned) ---------------------------------
+# Imported on the first real desktop action.  Rebinding the names here keeps
+# "except GuiBusy" working: nothing can raise it before _gui_lock() ran.
+_GUI_MOD = None
+
+
+class GuiBusy(Exception):
+    """Placeholder until gui_lock.GuiBusy is bound by _gui_lock()."""
+
+
+@contextlib.contextmanager
+def gui_locked(timeout_s: float = 30.0, poll_s: float = 0.05):
+    yield
+
+
+def _gui_lock():
+    """Import the shared GUI mutex on first use (keeps pathlib off the start)."""
+    global _GUI_MOD, GuiBusy, gui_locked
+    if _GUI_MOD is None:
+        try:
+            import gui_lock as mod
+        except Exception as exc:  # pragma: no cover - gui_lock.py is Lead-owned
+            log(f"gui_lock missing, desktop lock disabled: {exc}")
+            _GUI_MOD = False
+        else:
+            _GUI_MOD = mod
+            GuiBusy = mod.GuiBusy
+            gui_locked = mod.gui_locked
+    return _GUI_MOD
 
 SERVER_NAME = "supercu"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.2.0"
 DEFAULT_PROTOCOL = "2024-11-05"
 SHOT_MAX_LONG = 1728          # long side of the JPEG we hand to the client
 MAX_STEPS = 50
@@ -67,6 +98,18 @@ HOLD_MIN_MS = 20
 HOLD_MAX_MS = 10000
 MOUSE_BUTTONS = ("left", "right", "middle")
 ACT_MAP = {"set": "setvalue"}
+
+#: cu_do settle early-exit policy.  settle_ms is the requested wait after a
+#: changed GUI step; the remaining wait may end early ONLY when the previous
+#: action was a synchronous UIA pattern that changed a value / keyboard focus
+#: in-process (set -> ValuePattern.SetValue, focus -> SetFocus) and a cheap
+#: win32 probe proves the window frame is not moving.  Input synthesis
+#: (click / key / type / paste / drag / scroll / launch / close ...) always
+#: waits the full settle_ms, as do steps carrying expect and the last step.
+SETTLE_EARLY_OPS = frozenset({"set", "focus"})
+SETTLE_EARLY_VIAS = frozenset({"setvalue", "uia"})
+SETTLE_PROBE_MS = 12        # stable-probe interval while settling
+SETTLE_FLOOR_ENV = "SUPER_CU_SETTLE_MIN_MS"   # escape hatch: blind floor
 
 # --------------------------------------------------------------------------- #
 # protocol channel (stdout stays JSON-only)
@@ -240,15 +283,74 @@ def _as_region(value):
 
 # --------------------------------------------------------------------------- #
 # backend loading (T1's windows.py + bridge.py, or the bundled mock)
+#
+# No backend module is imported at startup: initialize/tools/list are pure
+# constants and answering them must stay cheap (bridge alone is 400-700ms).
+# The modules load on the first tool call, or are warmed by the post-initialize
+# prefetch thread (see _prefetch_worker) so the first cu_show is not slower.
 # --------------------------------------------------------------------------- #
-class Backend:
-    __slots__ = ("windows", "mod", "kind", "_bridge")
+def _load_mock_backend():
+    import mock_bridge
+    return mock_bridge, mock_bridge
 
-    def __init__(self, windows_mod, bridge_mod, kind):
-        self.windows = windows_mod
-        self.mod = bridge_mod
+
+def _load_real_backend():
+    # windows.py claims per-monitor DPI awareness at import time, so it must be
+    # imported before bridge (any UIA/PIL object) -- keep this order.
+    import windows as windows_mod
+    state = getattr(windows_mod, "DPI_STATE", None) or {}
+    log(f"dpi awareness={state.get('awareness')} screen={state.get('screen')} "
+        f"method={state.get('method')}")
+    import bridge as bridge_mod
+    return windows_mod, bridge_mod
+
+
+class Backend:
+    """Backend modules behind a lazy import.
+
+    'windows'/'bridge' are imported on first access; the import error is raised
+    to the caller so the server can render the same actionable setup message it
+    used to emit at startup.
+    """
+
+    __slots__ = ("kind", "_loader", "_windows", "_mod", "_bridge", "_prefetched")
+
+    def __init__(self, kind, loader):
         self.kind = kind
+        self._loader = loader
+        self._windows = None
+        self._mod = None
         self._bridge = None
+        self._prefetched = False
+
+    @property
+    def loaded(self) -> bool:
+        return self._mod is not None
+
+    @property
+    def prefetched(self) -> bool:
+        return self._prefetched
+
+    def note_prefetched(self) -> None:
+        self._prefetched = True
+
+    def ensure_modules(self):
+        """Import the backend modules (idempotent; creates no COM objects)."""
+        if self._mod is not None:
+            return
+        windows_mod, bridge_mod = self._loader()
+        self._windows = windows_mod
+        self._mod = bridge_mod
+
+    @property
+    def windows(self):
+        self.ensure_modules()
+        return self._windows
+
+    @property
+    def mod(self):
+        self.ensure_modules()
+        return self._mod
 
     @property
     def bridge(self):
@@ -256,6 +358,44 @@ class Backend:
             # deferred: UIA init costs ~500ms, keep initialize/tools/list fast
             self._bridge = self.mod.Bridge()
         return self._bridge
+
+
+# Importing bridge.py from a worker thread is only safe while the module stays
+# free of import-time COM creation.  bridge.py now applies
+# auto.SetGlobalSearchTimeout(1.0) from Bridge.__init__ (main thread) and
+# imports Pillow lazily inside screenshot(), so a worker import creates no UIA
+# object.  If bridge.py ever regresses to import-time COM, set this back to
+# False (or start the server with before initialize).
+PREFETCH_BRIDGE_MODULE = True
+
+def _prefetch_worker(backend) -> None:
+    """Warm the backend imports off the request path (daemon thread).
+
+    Imports only -- never builds a Bridge object and never touches COM.
+    """
+    t0 = time.perf_counter()
+    try:
+        if backend.kind == "mock":
+            import mock_bridge  # noqa: F401
+        else:
+            # windows.py is pure ctypes and claims DPI awareness process-wide.
+            import windows  # noqa: F401
+            try:  # Pillow: needed by screenshot / downscale, no COM
+                import PIL.Image  # noqa: F401
+            except Exception as exc:  # pragma: no cover - Pillow optional
+                log(f"prefetch PIL skipped: {type(exc).__name__}")
+            if PREFETCH_BRIDGE_MODULE:
+                import bridge  # noqa: F401
+        try:
+            import base64  # noqa: F401  (screen capture path only)
+        except Exception:  # pragma: no cover
+            pass
+    except Exception as exc:
+        log(f"prefetch skipped: {type(exc).__name__}: {exc}")
+        return
+    backend.note_prefetched()
+    log(f"prefetch done kind={backend.kind} "
+        f"{int((time.perf_counter() - t0) * 1000)}ms")
 
 
 # --------------------------------------------------------------------------- #
@@ -395,48 +535,76 @@ class SuperCuServer:
         self.snapshots: dict = {}
         self.last_shot = None          # normalized shot meta for @n / @img
         self.last_crop = None          # compact.format_snapshot crop stats
+        self._prefetch_started = False
         self._init_backend(force_mock)
 
     # -- setup ------------------------------------------------------------- #
-    @staticmethod
-    def _dpi():
-        try:
-            return ensure_dpi_aware()
-        except Exception as exc:  # pragma: no cover
-            log(f"dpi init failed: {exc}")
-            return {}
-
     def _init_backend(self, force_mock):
-        dpi = self._dpi()
-        log(f"dpi awareness={dpi.get('awareness')} screen={dpi.get('screen')} "
-            f"method={dpi.get('method')}")
+        """Record how to build the backend; the heavy imports stay lazy.
+
+        Startup used to import bridge.py (uiautomation + Pillow, 400-700ms)
+        only to answer initialize/tools/list, which need nothing from it.
+        """
         mock = force_mock or os.environ.get("SUPER_CU_MOCK") == "1"
         if mock:
-            try:
-                import mock_bridge
-                self.backend = Backend(mock_bridge, mock_bridge, "mock")
-                log("backend: mock (no real desktop access)")
-                return
-            except Exception as exc:
-                self.backend_error = f"mock 后端加载失败：{exc}"
-                log(self.backend_error)
-                return
-        try:
-            import bridge as bridge_mod
-            import windows as windows_mod
-            self.backend = Backend(windows_mod, bridge_mod, "real")
-            log("backend: real bridge")
-        except Exception as exc:
-            self.backend_error = (
-                f"bridge 未就绪：{type(exc).__name__}: {exc}。"
-                "T1 交付 src/bridge.py 后重启本进程；开发调试用 --mock。")
-            log(self.backend_error)
+            self.backend = Backend("mock", _load_mock_backend)
+            log("backend: mock (lazy load, no real desktop access)")
+        else:
+            self.backend = Backend("real", _load_real_backend)
+            log("backend: real bridge (lazy load, imports on first tool call)")
 
     def _b(self) -> Backend:
-        if self.backend is None:
+        backend = self.backend
+        if backend is None:
             raise ToolError(self.backend_error or "后端未初始化",
                             advice="等 T1 的 bridge.py 就绪后重启；或用 --mock 调试协议")
-        return self.backend
+        if backend.loaded:
+            return backend
+        try:
+            backend.ensure_modules()
+        except Exception as exc:
+            if backend.kind == "mock":
+                self.backend_error = f"mock 后端加载失败：{exc}"
+            else:
+                self.backend_error = (
+                    f"bridge 未就绪：{type(exc).__name__}: {exc}。"
+                    "T1 交付 src/bridge.py 后重启本进程；开发调试用 --mock。")
+            log(self.backend_error)
+            raise ToolError(
+                self.backend_error,
+                advice="等 T1 的 bridge.py 就绪后重启；或用 --mock 调试协议") from exc
+        return backend
+
+    # -- import prefetch ---------------------------------------------------- #
+    def maybe_prefetch(self) -> bool:
+        """Warm the backend imports in a background thread after the handshake.
+
+        Called from the main loop after the initialize/tools-list responses are
+        on the wire: arming must not add latency to those answers (see the raw
+        thread start below).  The worker imports modules only -- no COM object
+        is created off the main thread.
+
+        Returns True when a worker was started.  Safe to call repeatedly and
+        disabled by SUPER_CU_NO_PREFETCH=1.
+        """
+        if self._prefetch_started:
+            return False
+        backend = self.backend
+        if backend is None or backend.loaded:
+            return False
+        self._prefetch_started = True
+        if os.environ.get("SUPER_CU_NO_PREFETCH") == "1":
+            log("prefetch disabled by SUPER_CU_NO_PREFETCH=1")
+            return False
+        # Raw thread start, not threading.Thread().start(): the latter waits
+        # for the new thread to be scheduled (measured 100-150ms on a loaded
+        # machine) and would stall the protocol loop between initialize and the
+        # tools/list every client sends right after it.  This call returns
+        # immediately, and the prefetch thread is not part of interpreter
+        # shutdown bookkeeping (importer only, process exits when stdin closes).
+        import _thread
+        _thread.start_new_thread(_prefetch_worker, (backend,))
+        return True
 
     # -- protocol methods -------------------------------------------------- #
     def initialize(self, params):
@@ -475,7 +643,7 @@ class SuperCuServer:
         except ToolError as exc:
             return self._tool_error(exc.render())
         except Exception as exc:  # never kill the process
-            log("tool traceback: " + traceback.format_exc().replace("\n", " | "))
+            log("tool traceback: " + _tb())
             return self._tool_error(
                 f"内部错误：{type(exc).__name__}: {exc}\n"
                 f"→ 先 cu_show 重试；若持续失败检查 bridge 日志（stderr [supercu]）")
@@ -522,6 +690,87 @@ class SuperCuServer:
             log(f"cu_do observe budget crop hwnd={hwnd} "
                 f"hidden={crop_stats.get('hidden')}")
         return text
+
+    # -- settle after a changed step --------------------------------------- #
+    @staticmethod
+    def _settle_probe(b, hwnd):
+        """Cheap win32 state used to prove the window frame stopped moving.
+
+        Three win32 calls only (no UIA walk, no snapshot): rect + title +
+        foreground + window count, so a probe costs ~2-5ms.
+        """
+        wins = b.windows.list_windows()
+        rect = b.windows.get_rect(hwnd)
+        foreground = int(b.windows.foreground_hwnd() or 0)
+        title = ""
+        for win in wins:
+            try:
+                if int(win.get("hwnd") or 0) == int(hwnd):
+                    title = win.get("title") or ""
+                    break
+            except (TypeError, ValueError):
+                continue
+        return (tuple(int(v) for v in rect), title, foreground, len(wins))
+
+    def _settle(self, b, hwnd, step, res, settle_ms, *, more_steps):
+        """Wait after a changed step; may end early only when provably stable.
+
+        The requested settle_ms is the upper bound.  Early exit requires ALL
+        of: another step follows, the step carries no expect (that wait
+        already settled the UI), the bridge changed the UI through a
+        synchronous UIA pattern (set -> setvalue, focus -> uia) instead of
+        input synthesis, and two cheap probes 12ms apart show the same window
+        frame.  SUPER_CU_SETTLE_MIN_MS keeps a blind floor as an escape hatch.
+        """
+        if settle_ms <= 0 or not more_steps:
+            return
+        started = time.perf_counter()
+        floor_ms = _settle_floor_ms()
+
+        def blind_remaining(note="") -> None:
+            # the unchanged behaviour: wait out the requested settle_ms, and
+            # never less than the SUPER_CU_SETTLE_MIN_MS floor
+            spent_ms = (time.perf_counter() - started) * 1000.0
+            left_ms = max(int(settle_ms), floor_ms) - spent_ms
+            if left_ms > 0:
+                time.sleep(left_ms / 1000.0)
+            if note:
+                log(note)
+
+        early = (not step.get("expect") and hwnd
+                 and step.get("op") in SETTLE_EARLY_OPS
+                 and res.get("via") in SETTLE_EARLY_VIAS)
+        if not early:
+            # input synthesis / other steps: unchanged blind wait
+            blind_remaining()
+            return
+        try:
+            previous = self._settle_probe(b, hwnd)
+        except Exception as exc:  # never fail a batch over a probe
+            blind_remaining(
+                f"settle probe unavailable: {type(exc).__name__}: {exc}")
+            return
+        deadline = started + settle_ms / 1000.0
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            time.sleep(min(SETTLE_PROBE_MS / 1000.0, remaining))
+            try:
+                current = self._settle_probe(b, hwnd)
+            except Exception as exc:  # probe lost mid-wait -> be conservative
+                blind_remaining(f"settle probe lost: {type(exc).__name__}: {exc}")
+                return
+            if current == previous:
+                log("settle early-exit "
+                    f"{int((time.perf_counter() - started) * 1000)}ms "
+                    f"< {settle_ms}ms op={step.get('op')} "
+                    f"via={res.get('via')}")
+                break
+            previous = current
+        left_ms = floor_ms - (time.perf_counter() - started) * 1000.0
+        if left_ms > 0:
+            time.sleep(left_ms / 1000.0)
 
     def _resolve_window(self, spec):
         b = self._b()
@@ -819,7 +1068,7 @@ class SuperCuServer:
                                  "元素无矩形），坐标仍用 @n:ux,uy")
                 image_blocks.append({
                     "type": "image",
-                    "data": base64.b64encode(data).decode("ascii"),
+                    "data": _b64(data),
                     "mimeType": mime,
                 })
             except Exception as exc:  # degrade to text-only, never fail cu_show
@@ -941,8 +1190,7 @@ class SuperCuServer:
                                   exc.advice or _advice_for(exc.message))
                         break
                     except Exception as exc:
-                        log("step traceback: "
-                            + traceback.format_exc().replace("\n", " | "))
+                        log("step traceback: " + _tb())
                         detail = f"{type(exc).__name__}: {exc}"
                         failed = (idx, label, detail, _advice_for(detail))
                         break
@@ -982,10 +1230,13 @@ class SuperCuServer:
                     if res.get("changed"):
                         last_changed = True
                         self.last_hwnd = last_hwnd or self.last_hwnd
-                    if (idx < len(steps) and settle_ms
-                            and res.get("changed")
-                            and step["op"] not in NO_GUI_OPS):
-                        time.sleep(settle_ms / 1000.0)
+                    if res.get("changed") and step["op"] not in NO_GUI_OPS:
+                        # settle_ms is the requested wait; a synchronous UIA
+                        # pattern change may leave it early when the window is
+                        # provably stable (see _settle).
+                        self._settle(b, last_hwnd or self.last_hwnd, step, res,
+                                     settle_ms,
+                                     more_steps=idx < len(steps))
         except GuiBusy as exc:
             raise ToolError(
                 f"桌面被别的操作占用，等锁超过 30s：{exc}",
@@ -1026,7 +1277,7 @@ class SuperCuServer:
                 text += "\n" + compact.format_shot_note(shot, len(data))
                 image_blocks.append({
                     "type": "image",
-                    "data": base64.b64encode(data).decode("ascii"),
+                    "data": _b64(data),
                     "mimeType": shot.get("mime") or "image/jpeg",
                 })
             except Exception as exc:
@@ -1248,6 +1499,7 @@ class SuperCuServer:
         """GUI lock for shared-desktop ops; mock never touches the real desktop."""
         if b.kind == "mock":
             return contextlib.nullcontext()
+        _gui_lock()   # binds the real gui_locked/GuiBusy on first use
         return gui_locked(timeout_s=timeout_s)
 
     def _clipboard_step(self, step):
@@ -1369,6 +1621,7 @@ class SuperCuServer:
                 if int(b.windows.foreground_hwnd() or 0) != hwnd:
                     # focus change is a shared-desktop operation: take the lock
                     # briefly (the bridge does the same for its own actions)
+                    _gui_lock()
                     with gui_locked(timeout_s=3.0):
                         b.windows.activate(hwnd)
             except GuiBusy:
@@ -1457,6 +1710,18 @@ def _short_reason(exc) -> str:
     return reason or "unknown error"
 
 
+def _settle_floor_ms() -> int:
+    """Blind settle floor from SUPER_CU_SETTLE_MIN_MS (escape hatch, default 0).
+
+    Set it (e.g. 120) on machines/apps where early settle exit is too aggressive:
+    every changed step then still waits at least that many milliseconds.
+    """
+    try:
+        return max(0, int(os.environ.get(SETTLE_FLOOR_ENV) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 # --------------------------------------------------------------------------- #
 # JSON-RPC dispatch
 # --------------------------------------------------------------------------- #
@@ -1514,7 +1779,7 @@ def handle_message(server, msg):
     except RpcError as exc:
         return _rpc_error(mid, exc.code, exc.message)
     except Exception as exc:  # pragma: no cover - defensive
-        log("dispatch traceback: " + traceback.format_exc().replace("\n", " | "))
+        log("dispatch traceback: " + _tb())
         return _rpc_error(mid, -32603, f"内部错误：{type(exc).__name__}: {exc}")
     return _rpc_result(mid, result)
 
@@ -1529,7 +1794,7 @@ def main(argv) -> int:
     log(f"starting pid={os.getpid()} argv={argv}")
     server = SuperCuServer(force_mock=mock)
     if server.backend is not None:
-        log(f"ready backend={server.backend.kind}")
+        log(f"ready backend={server.backend.kind} (lazy imports)")
     else:
         log("ready backend=none (tools will return setup errors)")
 
@@ -1553,11 +1818,11 @@ def main(argv) -> int:
             except OSError:
                 break
             continue
+        method = msg.get("method") if isinstance(msg, dict) else None
         try:
             response = handle_message(server, msg)
         except Exception:  # pragma: no cover - handle_message is defensive
-            log("handler traceback: "
-                + traceback.format_exc().replace("\n", " | "))
+            log("handler traceback: " + _tb())
             response = _rpc_error(msg.get("id") if isinstance(msg, dict) else None,
                                   -32603, "内部错误")
         if response is not None:
@@ -1565,6 +1830,15 @@ def main(argv) -> int:
                 emit(response)
             except OSError:
                 break
+            if method in ("initialize", "tools/list"):
+                # Tool discovery is over and the next message is model-paced
+                # (seconds), so this is the safe point to warm the UIA imports
+                # off the request path: first cu_show then skips the ~500ms
+                # import while initialize/tools-list stay instant.
+                try:
+                    server.maybe_prefetch()
+                except Exception as exc:  # pragma: no cover - never fatal
+                    log(f"prefetch arm failed: {type(exc).__name__}: {exc}")
     log("stdin closed, exiting")
     return 0
 

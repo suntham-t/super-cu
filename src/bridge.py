@@ -51,10 +51,6 @@ except ImportError:
 
 import uiautomation as auto
 
-from PIL import Image, ImageGrab
-
-auto.SetGlobalSearchTimeout(1.0)
-
 __all__ = [
     "Bridge",
     "BridgeError",
@@ -70,7 +66,53 @@ __all__ = [
     "collect_marks",
     "annotate_marks",
     "drag_path",
+    "MAX_IDS",
+    "MAX_WINDOWS",
 ]
+
+#: Retention caps for a long-running server: every Element holds a COM
+#: reference and every cached window holds a whole UIA element subtree, so both
+#: maps are bounded (oldest entries drop first; ids are never reused).
+MAX_IDS = 20000
+MAX_WINDOWS = 32
+
+#: uiautomation's global search timeout is applied once, from Bridge.__init__:
+#: importing this module must stay free of COM / UIA global state so the MCP
+#: server can cold-start lazily (see also the lazy PIL imports below).
+_UIA_GLOBALS_READY = False
+
+
+def _ensure_com() -> None:
+    """Claim a COM apartment on the CURRENT thread before any UIA/COM call.
+
+    comtypes runs CoInitializeEx() when *comtypes itself* is first imported, i.e.
+    on whichever thread imported it first.  The MCP server prefetches bridge from
+    a worker thread, so without this the main (request) thread would have no COM
+    apartment and the first cu_show fails with:
+        OSError: [WinError -2147221008] 尚未调用 CoInitialize。
+
+    CoInitializeEx is per-thread and idempotent (S_FALSE when the thread already
+    has an apartment); a host that already claimed another apartment model raises
+    RPC_E_CHANGED_MODE, which is harmless here because COM is available anyway.
+    """
+    try:
+        import comtypes
+
+        comtypes.CoInitializeEx()
+    except Exception:  # pragma: no cover - never fail to construct a Bridge
+        pass
+
+
+def _init_uia_globals() -> None:
+    """Apply uiautomation process-wide settings (idempotent, no COM creation)."""
+    global _UIA_GLOBALS_READY
+    if _UIA_GLOBALS_READY:
+        return
+    _UIA_GLOBALS_READY = True
+    try:
+        auto.SetGlobalSearchTimeout(1.0)
+    except Exception:  # pragma: no cover - never fail a snapshot over a setting
+        pass
 
 
 #: Actions that change focus / keyboard / mouse / window state: they must hold
@@ -827,6 +869,9 @@ class Element:
     control: Any
     node: dict = field(default_factory=dict)
     ts: float = 0.0
+    #: cache fast path: raw IUIAutomationElement with cached properties; the
+    #: live uiautomation Control is materialised lazily from it on first action.
+    cached_element: Any = None
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Element #{self.eid} {self.node.get('ct')!r} {self.node.get('name')!r}>"
@@ -906,7 +951,7 @@ def collect_marks(nodes: list[dict], crop: tuple[int, int, int, int], *, limit: 
 
 def annotate_marks(img, marks: list[dict], origin: list[int], scale: float):
     """Draw numbered boxes for *marks* on a PIL image (pure, returns a new image)."""
-    from PIL import ImageDraw
+    from PIL import Image, ImageDraw  # lazy: importing bridge must not load Pillow
 
     base = img.convert("RGB")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -933,13 +978,226 @@ def _norm(s: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# UIA cache-request fast path
+# --------------------------------------------------------------------------- #
+# A snapshot is dominated by cross-process reads: the legacy walk pays ~9
+# property round-trips per visited node plus RawViewWalker child/sibling calls,
+# while IUIAutomationElement.BuildUpdatedCache fetches the whole subtree in
+# ONE call and every later read hits a local cache.  Measured on a 580-node
+# Chromium window: legacy ~830ms, cached ~70ms (see bench/opt/bench.py).
+#
+# The cached traversal below mirrors _walk exactly (same DFS order, same
+# LEAF_TYPES pruning, same interactive_cap bounded DFS, same RuntimeId ->
+# stable-id mapping), so snapshot output is identical.  Rules:
+#
+# * TreeFilter = RawViewCondition because the legacy walker is uiautomation's
+#   RawViewWalker (_AutomationClient.ViewWalker); the default Control-VIEW
+#   filter would silently drop raw-only nodes.
+# * any exception / suspicious result -> stderr log + transparent fallback to
+#   the legacy walk; SUPER_CU_NO_CACHE=1 disables the path entirely.
+# * cached elements stay lazy: Element.control is None and the live
+#   uiautomation Control is materialised on first action (_materialize), so
+#   building a snapshot never pays ControlFromElement's live ControlType call.
+
+#: Environment kill switch: any truthy value forces the legacy per-node walk.
+_CACHE_OFF_ENV = "SUPER_CU_NO_CACHE"
+
+#: Properties cached for every element of the window subtree (order = call order).
+_CACHE_PROP_NAMES = (
+    "ControlTypeProperty",
+    "NameProperty",
+    "AutomationIdProperty",
+    "ClassNameProperty",
+    "IsEnabledProperty",
+    "IsOffscreenProperty",
+    "HasKeyboardFocusProperty",
+    "BoundingRectangleProperty",
+    "RuntimeIdProperty",
+)
+
+
+def _cache_prop_ids() -> tuple[int, ...]:
+    ids: list[int] = []
+    for name in _CACHE_PROP_NAMES:
+        pid = getattr(auto.PropertyId, name, None)
+        if pid is None:  # pragma: no cover - uiautomation ABI guard
+            return ()
+        ids.append(int(pid))
+    return tuple(ids)
+
+
+_CACHE_PROP_IDS = _cache_prop_ids()
+
+#: BuildUpdatedCache budget: past this a window's fast path is suspended for
+#: CACHE_SKIP_S seconds (the current snapshot still uses the already-paid cache).
+#: Measured worst case on this machine: 18ms (195-node Chromium), 137ms
+#: (128-node Explorer), 72ms (Notepad + 1500-line document); the budget is a
+#: safety valve for tree shapes we could not measure, not a normal limit.
+_CACHE_BUILD_BUDGET_MS = 250.0
+#: How long a window falls back to the legacy walk after a cache failure/slow build.
+_CACHE_SKIP_S = 60.0
+
+#: (IUIAutomation client, generated UIAutomationCore comtypes module)
+_UIA_CTX: tuple[Any, Any] | None = None
+
+
+def _uia_ctx() -> tuple[Any, Any] | None:
+    """The IUIAutomation client + typelib module used for cache requests.
+
+    Reuses the exact COM client uiautomation already created (one UIA instance
+    per process, same apartment); lazily creates our own only as a fallback.
+    Never raises.
+    """
+    global _UIA_CTX
+    if _UIA_CTX is not None:
+        return _UIA_CTX
+    try:
+        from uiautomation import uiautomation as _au  # same module, private client
+
+        cli = _au._AutomationClient.instance()
+        _UIA_CTX = (cli.IUIAutomation, cli.UIAutomationCore)
+        return _UIA_CTX
+    except Exception:
+        pass
+    try:  # pragma: no cover - only when uiautomation internals change
+        import comtypes.client
+
+        mod = comtypes.client.GetModule("UIAutomationCore.dll")
+        client = comtypes.client.CreateObject(
+            "{ff48dba4-60ef-4201-aa87-54103eef594e}", interface=mod.IUIAutomation
+        )
+        _UIA_CTX = (client, mod)
+        return _UIA_CTX
+    except Exception:
+        return None
+
+
+def _cache_enabled() -> bool:
+    raw = (os.environ.get(_CACHE_OFF_ENV) or "").strip().lower()
+    return raw in ("", "0", "false", "no", "off")
+
+
+def _cached_attr(el: Any, name: str, default: Any = None) -> Any:
+    """Read one Cached* property; default on unavailable (never raises)."""
+    try:
+        v = getattr(el, name)
+        return default if v is None else v
+    except Exception:
+        return default
+
+
+def _cached_ct(el: Any) -> str:
+    """Cached control type -> long name used by the *_TYPES tables."""
+    ct = _cached_attr(el, "CachedControlType", None)
+    if ct is None:
+        return ""
+    try:
+        return auto.ControlTypeNames.get(int(ct), "")
+    except Exception:
+        return ""
+
+
+def _cached_rect(el: Any) -> list[int]:
+    """Cached BoundingRectangle -> [l, t, r, b] (RECT struct or 4-tuple)."""
+    rect = _cached_attr(el, "CachedBoundingRectangle", None)
+    if rect is None:
+        return [0, 0, 0, 0]
+    try:  # comtypes RECT struct variant
+        return [int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)]
+    except Exception:
+        pass
+    try:  # plain (left, top, right, bottom) variant
+        vals = list(rect)[:4]
+        if len(vals) == 4:
+            return [int(v) for v in vals]
+    except Exception:
+        pass
+    return [0, 0, 0, 0]
+
+
+def _cached_rid(el: Any) -> tuple | None:
+    """Cached RuntimeId -> tuple (RuntimeId has no Cached* attribute)."""
+    try:
+        rid = el.GetCachedPropertyValue(auto.PropertyId.RuntimeIdProperty)
+    except Exception:
+        return None
+    if not rid:
+        return None
+    try:
+        # exactly what the legacy path keys ids on (_runtime_id -> tuple(rid))
+        return tuple(rid)
+    except Exception:
+        return None
+
+
+def _cached_children(el: Any) -> list[Any]:
+    """Cached children as a plain list (IUIAutomationElementArray isn't iterable)."""
+    try:
+        arr = el.GetCachedChildren()
+    except Exception:
+        return []
+    if not arr:
+        return []
+    try:
+        n = int(arr.Length)
+    except Exception:
+        return []
+    out: list[Any] = []
+    for i in range(n):
+        try:
+            child = arr.GetElement(i)
+        except Exception:
+            break
+        if child:
+            out.append(child)
+    return out
+
+
+def _cached_pattern(el: Any, pattern_id: int, iface: Any) -> Any:
+    """Typed cached pattern (QueryInterface on the raw IUnknown), or None."""
+    try:
+        raw = el.GetCachedPattern(pattern_id)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return raw.QueryInterface(iface)
+    except Exception:
+        return None
+
+
+def _live_control_from_element(el: Any) -> Any:
+    """uiautomation Control for a cached element (1 live ControlType call)."""
+    try:
+        return auto.Control.CreateControlFromElement(el)
+    except Exception:
+        return None
+
+
+class _CacheFallback(Exception):
+    """Cached path returned a suspicious result; use the legacy walk instead."""
+
+
+# --------------------------------------------------------------------------- #
 # Bridge
 # --------------------------------------------------------------------------- #
 class Bridge:
     """Stateful UIA bridge: caches ids and the last snapshot per window."""
 
-    def __init__(self, *, lock_timeout_s: float = 30.0) -> None:
+    def __init__(self, *, lock_timeout_s: float = 30.0, use_cache: bool | None = None) -> None:
+        # per-thread, MUST precede any UIA/COM object creation (see _ensure_com)
+        _ensure_com()
+        _init_uia_globals()
         self._lock_timeout_s = float(lock_timeout_s)
+        #: UIA cache-request fast path (see _walk_cached); None -> env switch.
+        self._use_cache = _cache_enabled() if use_cache is None else bool(use_cache)
+        #: windows whose cached path failed recently: legacy walk for a while.
+        self._cache_skip_until: dict[int, float] = {}
+        self._cache_warned: set[int] = set()
+        self._cache_warm: set[int] = set()
+        self._max_ids = int(MAX_IDS)
+        self._max_windows = int(MAX_WINDOWS)
         self._rid2id: dict[tuple, int] = {}
         self._id2el: dict[int, Element] = {}
         self._next_id = 1
@@ -1001,7 +1259,9 @@ class Bridge:
         ctl = auto.ControlFromHandle(hwnd)
         if not ctl:
             raise BridgeError(f"窗口 {hwnd} 无法通过 UIA 访问（可能已失效或权限不足）")
+        self._win_ctl.pop(hwnd, None)  # re-insert at the end = most recent
         self._win_ctl[hwnd] = ctl
+        self._trim_windows()
         return ctl
 
     def _drop_window(self, hwnd: int) -> None:
@@ -1012,12 +1272,14 @@ class Bridge:
         """Cache title/proc/pid so a re-created UWP window can be found again."""
         hwnd = int(info.get("hwnd") or 0)
         if hwnd:
+            self._win_info.pop(hwnd, None)  # re-insert at the end = most recent
             self._win_info[hwnd] = {
                 "title": info.get("title") or "",
                 "proc": info.get("proc") or "",
                 "pid": info.get("pid") or 0,
                 "class": info.get("class") or "",
             }
+            self._trim_windows()
 
     def _rehome(self, gone_hwnd: int) -> int | None:
         """Find the replacement of a window that was closed/re-created.
@@ -1093,12 +1355,35 @@ class Bridge:
     def _id_for(self, key: tuple | None) -> int:
         if key is None:
             return 0
-        eid = self._rid2id.get(key)
+        eid = self._rid2id.pop(key, None)
         if eid is None:
             eid = self._next_id
             self._next_id += 1
-            self._rid2id[key] = eid
+            # bounded retention: drop the least recently used element ids
+            while len(self._rid2id) >= self._max_ids:
+                old_key, old_eid = next(iter(self._rid2id.items()))
+                del self._rid2id[old_key]
+                self._id2el.pop(old_eid, None)
+        self._rid2id[key] = eid  # (re)insert at the end = most recently used
         return eid
+
+    def _remember_controls(self, controls: dict[int, Element]) -> None:
+        """Store elements in the id map, bounded and most-recently-used last.
+
+        Ids keep resolving after this (by_id never raises); only ids older than
+        the last MAX_IDS distinct elements are recycled.
+        """
+        for eid in controls:
+            self._id2el.pop(eid, None)  # re-insert at the end = most recent
+        self._id2el.update(controls)
+        while len(self._id2el) > self._max_ids:
+            self._id2el.pop(next(iter(self._id2el)), None)
+
+    def _trim_windows(self) -> None:
+        """Bound the window-keyed maps (_win_ctl / _win_info / _cache)."""
+        for d in (self._win_ctl, self._win_info, self._cache):
+            while len(d) > self._max_windows:
+                d.pop(next(iter(d)), None)
 
     def _runtime_id(self, ctl: Any) -> tuple | None:
         try:
@@ -1110,7 +1395,11 @@ class Bridge:
         return tuple(rid)
 
     def by_id(self, eid: int) -> Element | None:
-        """Look up a previously returned id.  Never touches COM, never raises."""
+        """Look up a previously returned id.  Never touches COM, never raises.
+
+        The id map is bounded (MAX_IDS): after a very long session the oldest
+        ids are dropped, so a miss only means "run cu_show again" -- actionable.
+        """
         try:
             return self._id2el.get(int(eid))
         except Exception:
@@ -1269,6 +1558,237 @@ class Bridge:
         el = Element(eid=eid, hwnd=0, rid=rid, control=ctl, node=node, ts=time.monotonic())
         return node, el
 
+    # -- cache fast path --------------------------------------------------- #
+    def _cache_note(self, hwnd: int, why: str) -> None:
+        """Log one fallback reason per window to stderr (never spam per call)."""
+        hwnd = int(hwnd or 0)
+        if hwnd in self._cache_warned:
+            return
+        self._cache_warned.add(hwnd)
+        try:
+            print(
+                f"[supercu] UIA cache fast-path 不可用，回退 legacy walk (hwnd={hwnd}): {why}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:
+            pass
+
+    def _cache_fail(self, hwnd: int, why: str) -> None:
+        """Log once and stop retrying the cache path for this window for a while."""
+        self._cache_note(hwnd, why)
+        self._cache_skip_until[int(hwnd or 0)] = time.monotonic() + _CACHE_SKIP_S
+
+    def _cache_usable(self, hwnd: int) -> bool:
+        if not self._use_cache:
+            return False
+        until = self._cache_skip_until.get(int(hwnd or 0))
+        return not (until and time.monotonic() < until)
+
+    def _walk_cached(
+        self,
+        root_el: Any,
+        *,
+        max_depth: int = 24,
+        view: str = "controls",
+        name_filter: str | None = None,
+        interactive_cap: int = 0,
+    ) -> tuple[list[tuple], int, bool, int]:
+        """DFS the cached subtree; mirrors _walk exactly (order/pruning/etc.).
+
+        Returns (candidates, visited, cut, root_children).  Candidates use the
+        same tuple shape as _walk(), but hold a raw cached IUIAutomationElement
+        instead of a uiautomation Control.
+        """
+        cands: list[tuple] = []
+        visited = 0
+        depth_cut = False
+        interactive = 0
+        root_kids = 0
+        stack: list[tuple] = [(root_el, 0, ())]
+        while stack:
+            el, depth, path = stack.pop()
+            visited += 1
+            ct = _cached_ct(el)
+            if ct in LEAF_TYPES:
+                kids: list = []
+            else:
+                kids = _cached_children(el)
+            nkids = len(kids)
+            if visited == 1:
+                root_kids = nkids
+            name = _cached_attr(el, "CachedName", "") or ""
+            if self._keep(ct, name, nkids, view, name_filter):
+                cands.append((el, depth, path, ct, name, nkids))
+                if ct in INTERACTIVE_TYPES:
+                    interactive += 1
+                    if interactive_cap and interactive >= interactive_cap:
+                        depth_cut = True  # bounded DFS: nothing deeper can be shown
+                        break
+            if kids:
+                if depth + 1 <= max_depth:
+                    npath = path + (name.strip(),) if name.strip() else path
+                    npath = npath[-3:]
+                    for k in reversed(kids):
+                        stack.append((k, depth + 1, npath))
+                else:
+                    depth_cut = True
+        return cands, visited, depth_cut, root_kids
+
+    def _cached_cands(
+        self,
+        root: Any,
+        *,
+        hwnd: int,
+        max_depth: int,
+        view: str,
+        name_filter: str | None,
+        interactive_cap: int,
+    ) -> tuple[list[tuple], int, bool, Any]:
+        """One BuildUpdatedCache + cached DFS.
+
+        Returns (candidates, visited, cut, comtypes module) or raises
+        _CacheFallback/anything else -- both mean "use the legacy walk".
+        """
+        if not _CACHE_PROP_IDS:  # pragma: no cover - uiautomation ABI guard
+            raise _CacheFallback("缺少 UIA 属性 id")
+        ctx = _uia_ctx()
+        if ctx is None:
+            raise _CacheFallback("无法获取 IUIAutomation COM 客户端")
+        client, mod = ctx
+        req = client.CreateCacheRequest()
+        for pid in _CACHE_PROP_IDS:
+            req.AddProperty(pid)
+        # ValuePattern is needed for edit/combobox values in every view;
+        # TextPattern only for view=text documents -- keep the cache request cheap.
+        req.AddPattern(auto.PatternId.ValuePattern)
+        if view == "text":
+            req.AddPattern(auto.PatternId.TextPattern)
+        req.TreeScope = mod.TreeScope_Subtree
+        req.TreeFilter = client.RawViewCondition  # legacy walker IS the raw view walker
+        root_el = root.Element
+        if not root_el:
+            raise _CacheFallback("窗口根元素不可用")
+        t_build = time.perf_counter()
+        cached_root = root_el.BuildUpdatedCache(req)
+        build_ms = (time.perf_counter() - t_build) * 1000.0
+        if not cached_root:
+            raise _CacheFallback("BuildUpdatedCache 返回空")
+        # adaptive guard: the build is the expensive half of the fast path, so a
+        # pathological window must not pay it on every snapshot.  The result we
+        # already paid for is used once, then the window skips the cache for
+        # CACHE_SKIP_S seconds (first build per window is warm-up, not counted).
+        warm = int(hwnd) in self._cache_warm
+        self._cache_warm.add(int(hwnd))
+        if warm and build_ms > _CACHE_BUILD_BUDGET_MS:
+            self._cache_fail(
+                hwnd,
+                f"BuildUpdatedCache {build_ms:.0f}ms 超过预算 "
+                f"{_CACHE_BUILD_BUDGET_MS:.0f}ms（本次仍使用缓存结果，{_CACHE_SKIP_S:.0f}s 内改走 legacy）",
+            )
+        # Sanity: the cached tree must be the same element the legacy walk starts
+        # from, and a non-leaf root with zero cached children means a broken tree.
+        live_ct = _prop(root, "ControlTypeName", "") or ""
+        cached_ct = _cached_ct(cached_root)
+        if not live_ct:
+            raise _CacheFallback("根元素 live 类型不可用")
+        if cached_ct and cached_ct != live_ct:
+            raise _CacheFallback(f"根元素类型不一致 cached={cached_ct!r} live={live_ct!r}")
+        cands, visited, depth_cut, root_kids = self._walk_cached(
+            cached_root,
+            max_depth=max_depth,
+            view=view,
+            name_filter=name_filter,
+            interactive_cap=interactive_cap,
+        )
+        if visited <= 0:
+            raise _CacheFallback("cached 遍历 visited=0")
+        if root_kids == 0 and live_ct not in LEAF_TYPES:
+            raise _CacheFallback(f"cached 根节点无子节点（{live_ct}）")
+        return cands, visited, depth_cut, mod
+
+    def _cached_value(self, el: Any, mod: Any) -> Any:
+        """ValuePattern.Value from the cache (live read as fallback)."""
+        pat = _cached_pattern(el, auto.PatternId.ValuePattern, mod.IUIAutomationValuePattern)
+        if pat is not None:
+            try:
+                return pat.CurrentValue
+            except Exception:
+                pass
+        ctl = _live_control_from_element(el)
+        try:
+            vp = ctl.GetValuePattern() if ctl else None
+            return vp.Value if vp else None
+        except Exception:
+            return None
+
+    def _cached_doc_text(self, el: Any, mod: Any) -> Any:
+        """TextPattern.DocumentRange text from the cache (live read as fallback)."""
+        pat = _cached_pattern(el, auto.PatternId.TextPattern, mod.IUIAutomationTextPattern)
+        if pat is not None:
+            try:
+                return (pat.DocumentRange.GetText(2000) or "")[:2000]
+            except Exception:
+                pass
+        ctl = _live_control_from_element(el)
+        try:
+            tp = ctl.GetTextPattern() if ctl else None
+            return (tp.DocumentRange.GetText(2000) or "")[:2000] if tp else None
+        except Exception:
+            return None
+
+    def _make_node_cached(
+        self, cand: tuple, *, mod: Any, with_value: bool = True, with_doc_text: bool = False
+    ) -> tuple[dict | None, Element | None]:
+        """_make_node() built from cached properties (no live property reads)."""
+        el, depth, path, ct, name, nkids = cand
+        short = CT_SHORT.get(ct, "other")
+        rid = _cached_rid(el)
+        rect = _cached_rect(el)
+        aid = _cached_attr(el, "CachedAutomationId", "") or ""
+        cls = _cached_attr(el, "CachedClassName", "") or ""
+        enabled = _cached_attr(el, "CachedIsEnabled", True)
+        offscreen = _cached_attr(el, "CachedIsOffscreen", False)
+        focused = _cached_attr(el, "CachedHasKeyboardFocus", False)
+        key = rid if rid is not None else ("noid", ct, name, aid, tuple(rect))
+        eid = self._id_for(key)
+
+        val = None
+        if with_value and short in ("edit", "combobox"):
+            val = self._cached_value(el, mod)
+        if with_doc_text and short == "document":
+            val = self._cached_doc_text(el, mod)
+
+        if _area(rect) == 0 and bool(offscreen) and not name:
+            return None, None
+
+        node = {
+            "id": eid,
+            "ct": short,
+            "name": name,
+            "val": val,
+            "aid": aid or None,
+            "cls": cls or None,
+            "rect": rect,
+            "enabled": bool(enabled) if enabled is not None else True,
+            "offscreen": bool(offscreen),
+            "focused": bool(focused),
+            "patterns": list(PATTERN_HINTS.get(short, [])),
+            "kids": nkids,
+            "depth": depth,
+            "path": "/".join(path),
+        }
+        node_el = Element(
+            eid=eid,
+            hwnd=0,
+            rid=rid,
+            control=None,
+            node=node,
+            ts=time.monotonic(),
+            cached_element=el,
+        )
+        return node, node_el
+
     # -- snapshot ---------------------------------------------------------- #
     def snapshot(
         self,
@@ -1291,25 +1811,47 @@ class Bridge:
         view = (view or "controls").lower()
         if view not in ("controls", "text", "all"):
             raise BridgeError(f"未知 view: {view}")
-        try:
-            cands, visited, depth_cut = self._walk(
-                root,
-                max_depth=max_depth,
-                view=view,
-                name_filter=name_filter,
-                interactive_cap=int(max_nodes or 0) if (view == "controls" and not name_filter) else 0,
-            )
-        except Exception as exc:
-            # Window tree was rebuilt underneath us -- retry once with a fresh root.
-            self._drop_window(hwnd)
-            root = self._control_for(hwnd)
-            cands, visited, depth_cut = self._walk(
-                root,
-                max_depth=max_depth,
-                view=view,
-                name_filter=name_filter,
-                interactive_cap=int(max_nodes or 0) if (view == "controls" and not name_filter) else 0,
-            )
+        interactive_cap = (
+            int(max_nodes or 0) if (view == "controls" and not name_filter) else 0
+        )
+        cands: list[tuple] | None = None
+        visited = 0
+        depth_cut = False
+        cached_mod: Any = None
+        if self._cache_usable(hwnd):
+            try:
+                cands, visited, depth_cut, cached_mod = self._cached_cands(
+                    root,
+                    hwnd=hwnd,
+                    max_depth=max_depth,
+                    view=view,
+                    name_filter=name_filter,
+                    interactive_cap=interactive_cap,
+                )
+            except Exception as exc:  # ANY cache/COM hiccup -> legacy walk
+                cands = None
+                cached_mod = None
+                self._cache_fail(hwnd, f"{type(exc).__name__}: {exc}")
+        if cands is None:
+            try:
+                cands, visited, depth_cut = self._walk(
+                    root,
+                    max_depth=max_depth,
+                    view=view,
+                    name_filter=name_filter,
+                    interactive_cap=interactive_cap,
+                )
+            except Exception:
+                # Window tree was rebuilt underneath us -- retry once with a fresh root.
+                self._drop_window(hwnd)
+                root = self._control_for(hwnd)
+                cands, visited, depth_cut = self._walk(
+                    root,
+                    max_depth=max_depth,
+                    view=view,
+                    name_filter=name_filter,
+                    interactive_cap=interactive_cap,
+                )
 
         truncated = bool(depth_cut)
         total = visited
@@ -1324,8 +1866,13 @@ class Bridge:
         controls: dict[int, Element] = {}
         doc_text = view == "text"
         for cand in cands:
-            node, el = self._make_node(cand, with_doc_text=doc_text)
-            if node is None:
+            if cached_mod is not None:
+                node, el = self._make_node_cached(
+                    cand, mod=cached_mod, with_doc_text=doc_text
+                )
+            else:
+                node, el = self._make_node(cand, with_doc_text=doc_text)
+            if node is None or el is None:
                 continue
             if node["id"] in seen:
                 continue
@@ -1335,8 +1882,10 @@ class Bridge:
             nodes.append(node)
             controls[node["id"]] = el
 
-        self._id2el.update(controls)
+        self._remember_controls(controls)
+        self._cache.pop(hwnd, None)  # re-insert at the end = most recent
         self._cache[hwnd] = {"nodes": nodes, "ts": time.monotonic(), "controls": controls}
+        self._trim_windows()
         elapsed = int(round((time.perf_counter() - t0) * 1000))
         return {
             "hwnd": hwnd,
@@ -1459,7 +2008,7 @@ class Bridge:
             el = Element(node["id"], hwnd, self._runtime_id(ctl), ctl, node, time.monotonic())
         assert el is not None
         el.hwnd = int(hwnd)
-        self._id2el[el.eid] = el
+        self._remember_controls({el.eid: el})
         return el
 
     def _search(self, hwnd: int, ct_wanted: str | None, name_pat: str) -> list[tuple]:
@@ -1510,7 +2059,10 @@ class Bridge:
                 raise BridgeError(f"元素 id 格式应为 #123: {spec!r}") from exc
             el = self.by_id(eid)
             if el is None:
-                raise BridgeError(f"元素 id {eid} 未知（不在本次会话的任何快照中），请先 cu_show 重新获取")
+                raise BridgeError(
+                    f"元素 id {eid} 未知（可能已被回收：长时间运行只保留最近的元素；"
+                    f"也可能不在本次快照中），请先 cu_show 重新获取"
+                )
             _ctl, how = self._revive(el, hwnd)
             meta = {"via": "id", "node": el.node, "candidates": []}
             if how and how not in ("live", "rid"):
@@ -1580,7 +2132,8 @@ class Bridge:
         el.control = new_el.control
         el.rid = new_el.rid
         el.node = new_el.node
-        self._id2el[el.eid] = el
+        el.cached_element = new_el.cached_element
+        self._remember_controls({el.eid: el})
         if what == "rid":
             return el.control, "rid"
         return el.control, f"relocated={what}"
@@ -1624,9 +2177,27 @@ class Bridge:
                 return self._adopt(el, hits[0], hwnd, f"path:{want_path[-30:]}")
         return None
 
+    def _materialize(self, el: Element) -> Any:
+        """Live uiautomation Control for *el* (cached fast-path nodes are lazy).
+
+        Snapshot nodes only hold a cached IUIAutomationElement; creating the real
+        Control eagerly would cost one live ControlType call per node.  It is
+        created here on the first action instead.  ControlTypeName below is then
+        a LIVE read, so a rebuilt tree still falls through to the relocate path.
+        """
+        ctl = el.control
+        if ctl is not None:
+            return ctl
+        cached = el.cached_element
+        if cached is None:
+            return None
+        ctl = _live_control_from_element(cached)
+        el.control = ctl
+        return ctl
+
     def _revive(self, el: Element, hwnd: int) -> tuple[Any, str]:
         """Return (live control, how); relocate by RuntimeId then semantically."""
-        ctl = el.control
+        ctl = self._materialize(el)
         try:
             if _prop(ctl, "ControlTypeName", None):
                 return ctl, "live"
@@ -2644,6 +3215,8 @@ class Bridge:
         marks: bool = False,
         marks_max: int = 120,
     ) -> dict:
+        from PIL import Image, ImageGrab  # lazy: importing bridge must not load Pillow
+
         t0 = time.perf_counter()
         self.space_check()
         vx, vy, vw, vh = _win.virtual_screen()

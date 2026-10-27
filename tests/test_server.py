@@ -223,7 +223,7 @@ def test_protocol():
         check("initialize capabilities.tools == {}",
               result.get("capabilities") == {"tools": {}})
         check("initialize serverInfo",
-              result.get("serverInfo") == {"name": "supercu", "version": "1.0.0"},
+              result.get("serverInfo") == {"name": "supercu", "version": "1.2.0"},
               str(result.get("serverInfo")))
 
         second = session.send("initialize", {})
@@ -267,6 +267,21 @@ def test_protocol():
                "assert", "drag", "paste"} <= set(op_enum), str(len(op_enum)))
         check("cu_do observe defaults to auto",
               do_props.get("observe", {}).get("default") == "auto")
+
+        # -- post-initialize cold-start prefetch --------------------------- #
+        # The main loop arms a daemon import-prefetch right after answering
+        # initialize/tools-list, so the first cu_show does not pay the UIA
+        # module import.  It must stay invisible on the protocol channel.
+        deadline = time.perf_counter() + 3.0
+        logs = ""
+        while time.perf_counter() < deadline:
+            logs = session.stderr_text()
+            if "prefetch done" in logs:
+                break
+            time.sleep(0.02)
+        check("prefetch: backend imports warmed after initialize",
+              "prefetch done kind=mock" in logs,
+              (logs.strip().splitlines() or [""])[-1][:80])
 
         # -- unknown method / malformed JSON ------------------------------- #
         unknown = session.send("totally/unknown")
@@ -1149,6 +1164,261 @@ def test_drag_passthrough_inprocess():
 
 
 # --------------------------------------------------------------------------- #
+# 3d. lazy backend import + post-initialize prefetch (cold start)
+# --------------------------------------------------------------------------- #
+def test_lazy_backend_inprocess():
+    section("lazy backend import / prefetch (cold start, in-process)")
+    import server as server_mod
+
+    forced_mock = os.environ.get("SUPER_CU_MOCK") == "1"
+    # -- building a server must not import any backend module ---------------- #
+    srv = server_mod.SuperCuServer(force_mock=False)
+    check("lazy: backend kind is recorded without importing modules",
+          srv.backend is not None
+          and srv.backend.kind == ("mock" if forced_mock else "real"),
+          str(srv.backend and srv.backend.kind))
+    check("lazy: no backend module imported at construction",
+          srv.backend.loaded is False
+          and "bridge" not in sys.modules and "windows" not in sys.modules,
+          "bridge=" + str("bridge" in sys.modules)
+          + " windows=" + str("windows" in sys.modules))
+    init = srv.initialize({})
+    check("lazy: initialize answers without the backend",
+          init.get("serverInfo", {}).get("name") == "supercu"
+          and srv.backend.loaded is False)
+    check("lazy: tools/list answers without the backend",
+          len(srv.tools_list().get("tools") or []) == 2
+          and srv.backend.loaded is False)
+
+    # -- the mock backend loads on the first tool call ----------------------- #
+    srv_mock = server_mod.SuperCuServer(force_mock=True)
+    check("lazy: mock backend is unloaded after construction",
+          srv_mock.backend.loaded is False)
+    srv_mock.tools_list()
+    check("lazy: tools/list leaves the mock backend unloaded",
+          srv_mock.backend.loaded is False)
+    first = srv_mock.cu_show({"scope": "desktop"})
+    first_text = (first.get("content") or [{}])[0].get("text", "")
+    check("lazy: first tool call loads the backend",
+          srv_mock.backend.loaded is True and first_text.startswith("desktop "),
+          first_text.splitlines()[0][:80] if first_text else "")
+
+    # -- prefetch warms imports but never builds the Bridge ------------------ #
+    srv_pf = server_mod.SuperCuServer(force_mock=True)
+    check("prefetch: worker starts for an unloaded backend",
+          srv_pf.maybe_prefetch() is True)
+    check("prefetch: armed only once", srv_pf.maybe_prefetch() is False)
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not srv_pf.backend.prefetched:
+        time.sleep(0.02)
+    check("prefetch: modules imported in the background",
+          srv_pf.backend.prefetched is True)
+    check("prefetch: Bridge stays lazy (no COM off the calling thread)",
+          srv_pf.backend.loaded is False and srv_pf.backend._bridge is None)
+
+    os.environ["SUPER_CU_NO_PREFETCH"] = "1"
+    try:
+        srv_off = server_mod.SuperCuServer(force_mock=True)
+        check("prefetch: disabled by SUPER_CU_NO_PREFETCH=1",
+              srv_off.maybe_prefetch() is False)
+    finally:
+        os.environ.pop("SUPER_CU_NO_PREFETCH", None)
+
+    # -- gui_lock is imported on demand, then bound to the real classes ------ #
+    mod = server_mod._gui_lock()
+    check("gui_lock: imported on first use and bound to gui_lock.py",
+          mod is not False and server_mod.GuiBusy is mod.GuiBusy
+          and server_mod.gui_locked is mod.gui_locked)
+    check("gui_lock: import is idempotent", server_mod._gui_lock() is mod)
+
+    # -- deferred stdlib helpers (base64 / traceback) ----------------------- #
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        tb_text = server_mod._tb()
+    check("deferred helpers: _b64 and _tb work",
+          server_mod._b64(b"ab") == "YWI=" and "ValueError" in tb_text,
+          tb_text[:60])
+
+
+def test_lazy_backend_error_inprocess():
+    section("lazy backend import error (surfaces on the first tool call)")
+    import server as server_mod
+
+    if os.environ.get("SUPER_CU_MOCK") == "1":
+        print("SKIP lazy error path: SUPER_CU_MOCK=1 forces the mock backend")
+        return
+    original = server_mod._load_real_backend
+
+    def boom():
+        raise ImportError("uiautomation is not installed")
+
+    server_mod._load_real_backend = boom
+    try:
+        srv = server_mod.SuperCuServer(force_mock=False)
+        check("lazy error: construction still succeeds", srv.backend is not None)
+        result = srv.tools_call({"name": "cu_show", "arguments": {}})
+        text = (result.get("content") or [{}])[0].get("text", "")
+        check("lazy error: first tool call returns isError",
+              result.get("isError") is True)
+        check("lazy error: same actionable setup message as before",
+              "bridge 未就绪" in text and "ImportError" in text,
+              text.splitlines()[0][:100] if text else "")
+        check("lazy error: advice points at --mock",
+              "→" in text and "--mock" in text,
+              text.splitlines()[-1][:100] if text else "")
+        check("lazy error: initialize/tools/list stay healthy",
+              len(srv.tools_list().get("tools") or []) == 2
+              and srv.initialize({}).get("protocolVersion") == "2024-11-05")
+    finally:
+        server_mod._load_real_backend = original
+
+
+# --------------------------------------------------------------------------- #
+# 3e. prefetch thread must not steal COM init (real backend, spawned server)
+# --------------------------------------------------------------------------- #
+def test_prefetch_com_race():
+    """Regression: the prefetch worker imports bridge, and comtypes calls
+    CoInitializeEx at import time in THAT thread.  If the worker wins the race
+    the main thread has no COM apartment and the first real snapshot dies with
+    "尚未调用 CoInitialize".  Wait until the prefetch log reports completion,
+    then take the first snapshot: it must not be an error.
+    """
+    section("post-initialize prefetch vs COM apartment (spawned real server)")
+    if sys.platform != "win32":
+        print("SKIP COM race check: not Windows")
+        return
+    if not os.path.exists(os.path.join(SRC, "bridge.py")):
+        print("SKIP COM race check: src/bridge.py missing")
+        return
+    session = Session(args=())
+    try:
+        init = session.send("initialize", {"protocolVersion": "2024-11-05"})
+        if "error" in init:
+            print("SKIP COM race check: initialize failed: "
+                  + str(init.get("error"))[:120])
+            return
+        session.notify("notifications/initialized")
+        session.send("tools/list")
+        # any window is enough; listing windows is EnumWindows only (no UIA)
+        desktop = text_of(session.call("cu_show", {"scope": "desktop"}))
+        match = re.search(r"#(\d+)", desktop)
+        if not match:
+            print("SKIP COM race check: no desktop window available: "
+                  + (desktop.splitlines() or [""])[0][:100])
+            return
+        target = "#" + match.group(1)
+        # wait for the prefetch worker to report completion: from then on the
+        # COM-initialising import definitely belongs to the worker thread
+        deadline = time.perf_counter() + 10.0
+        logs = ""
+        while time.perf_counter() < deadline:
+            logs = session.stderr_text()
+            if "prefetch done" in logs or "prefetch skipped" in logs:
+                break
+            time.sleep(0.05)
+        if "prefetch done" not in logs:
+            print("SKIP COM race check: prefetch did not complete: "
+                  + (logs.strip().splitlines() or [""])[-1][:120])
+            return
+        started = time.perf_counter()
+        show = session.call("cu_show", {"window": target}, timeout=60)
+        wall = int((time.perf_counter() - started) * 1000)
+        text = text_of(show)
+        if is_error(show) and ("没有找到窗口" in text or "已关闭" in text):
+            print("SKIP COM race check: window disappeared: " + text[:120])
+            return
+        check("prefetch COM race: first snapshot after warm-up is not an error",
+              not is_error(show), f"{wall}ms :: " + text[:150])
+        check("prefetch COM race: no CoInitialize error on the main thread",
+              "CoInitialize" not in text, text[:150])
+    finally:
+        session.close()
+
+# --------------------------------------------------------------------------- #
+# 3f. cu_do adaptive settle (synchronous UIA pattern may end the wait early)
+# --------------------------------------------------------------------------- #
+def test_settle_inprocess():
+    section("cu_do adaptive settle (in-process)")
+    import server as server_mod
+    import mock_bridge
+
+    mock_bridge.reset()
+    srv = server_mod.SuperCuServer(force_mock=True)
+    b = srv._b()
+
+    def timed(step, res, settle_ms, *, more_steps=True):
+        started = time.perf_counter()
+        srv._settle(b, 1001, step, res, settle_ms, more_steps=more_steps)
+        return (time.perf_counter() - started) * 1000.0
+
+    set_res = {"changed": True, "via": "setvalue"}
+    click_res = {"changed": True, "via": "click"}
+
+    early_ms = timed({"op": "set"}, set_res, 120)
+    check("settle: set/setvalue leaves the wait early", early_ms < 100,
+          "%.0fms of 120ms" % early_ms)
+    focus_ms = timed({"op": "focus"}, {"changed": True, "via": "uia"}, 120)
+    check("settle: focus/uia leaves the wait early", focus_ms < 100,
+          "%.0fms of 120ms" % focus_ms)
+    blind_ms = timed({"op": "click"}, click_res, 120)
+    check("settle: click keeps the full blind wait", blind_ms >= 110,
+          "%.0fms of 120ms" % blind_ms)
+    key_ms = timed({"op": "key"}, {"changed": True, "via": "keys"}, 120)
+    check("settle: key keeps the full blind wait", key_ms >= 110,
+          "%.0fms of 120ms" % key_ms)
+    expect_ms = timed({"op": "set", "expect": "hello"}, set_res, 120)
+    check("settle: step with expect keeps the full wait", expect_ms >= 110,
+          "%.0fms of 120ms" % expect_ms)
+    last_ms = timed({"op": "set"}, set_res, 120, more_steps=False)
+    check("settle: last step is not settled", last_ms < 50,
+          "%.0fms" % last_ms)
+    zero_ms = timed({"op": "set"}, set_res, 0)
+    check("settle: settle_ms=0 disables the wait", zero_ms < 50,
+          "%.0fms" % zero_ms)
+
+    os.environ["SUPER_CU_SETTLE_MIN_MS"] = "150"
+    try:
+        floor_ms = timed({"op": "set"}, set_res, 120)
+        check("settle: SUPER_CU_SETTLE_MIN_MS forces a blind floor",
+              floor_ms >= 140, "%.0fms with floor=150" % floor_ms)
+        click_floor_ms = timed({"op": "click"}, click_res, 120)
+        check("settle: floor never shortens the blind wait",
+              click_floor_ms >= 110, "%.0fms of 120ms" % click_floor_ms)
+    finally:
+        os.environ.pop("SUPER_CU_SETTLE_MIN_MS", None)
+
+    def boom_probe(*_args, **_kwargs):
+        raise RuntimeError("no desktop")
+
+    original_probe = srv._settle_probe
+    srv._settle_probe = boom_probe
+    try:
+        fallback_ms = timed({"op": "set"}, set_res, 120)
+    finally:
+        srv._settle_probe = original_probe
+    check("settle: probe failure falls back to the blind wait",
+          fallback_ms >= 110, "%.0fms of 120ms" % fallback_ms)
+
+    # the five-step shape used by the real benchmark has to stay successful
+    mock_bridge.reset()
+    batch = srv.cu_do({"steps": [
+        {"op": "click", "target": "edit:文本编辑器", "window": "#1001"},
+        {"op": "set", "target": "edit:文本编辑器", "text": "hello",
+         "window": "#1001"},
+        {"op": "key", "keys": "enter"},
+        {"op": "focus", "target": "edit:文本编辑器", "window": "#1001"},
+        {"op": "wait", "wait_kind": "text", "text": "hello",
+         "timeout_ms": 1500},
+    ]})
+    text = (batch.get("content") or [{}])[0].get("text", "")
+    check("settle: five-step mock batch still succeeds",
+          not batch.get("isError") and text.count(" ok ") >= 5,
+          text.splitlines()[0][:80] if text else "")
+    mock_bridge.reset()
+
+
+# --------------------------------------------------------------------------- #
 # 4. real bridge regression (runs automatically once T1 lands)
 # --------------------------------------------------------------------------- #
 def test_real():
@@ -1313,9 +1583,13 @@ def main(argv) -> int:
     test_coordinates_inprocess()
     test_observe_budget_inprocess()
     test_drag_passthrough_inprocess()
+    test_lazy_backend_inprocess()
+    test_lazy_backend_error_inprocess()
+    test_settle_inprocess()
     test_protocol()
     real_available = os.path.exists(os.path.join(SRC, "bridge.py"))
     if "--mock-only" not in argv and (real_available or "--real" in argv):
+        test_prefetch_com_race()
         test_real()
     else:
         section("real bridge integration")

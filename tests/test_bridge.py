@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import io
 import os
 import subprocess
 import sys
@@ -1646,6 +1647,423 @@ def t_drag_path_axis() -> str:
     )
 
 
+
+# --------------------------------------------------------------------------- #
+# 14. cache fast path: pure unit tests (no desktop, run in --unit-only too)
+# --------------------------------------------------------------------------- #
+class _FakeRect:
+    """Minimal uiautomation.Rect look-alike (left/top/right/bottom ints)."""
+
+    def __init__(self, l: int, t: int, r: int, b: int):
+        self.left, self.top, self.right, self.bottom = int(l), int(t), int(r), int(b)
+
+
+class _FakePattern:
+    """Duck-typed ValuePattern/TextPattern used by both walk paths."""
+
+    def __init__(self, *, value=None, text=None):
+        self.CurrentValue = value
+        self._text = text
+        if text is not None:
+            outer = self
+
+            class _Range:
+                def GetText(self, n):
+                    return outer._text[:n]
+
+            self.DocumentRange = _Range()
+
+    @property
+    def Value(self):
+        return self.CurrentValue
+
+    def QueryInterface(self, iface):
+        return self
+
+
+class _FakeMod:
+    IUIAutomationValuePattern = "value-iface"
+    IUIAutomationTextPattern = "text-iface"
+
+
+class _FakeElement:
+    """One object exposing BOTH the live-Control and the Cached* property API,
+    so _make_node and _make_node_cached can be compared node-for-node offline."""
+
+    def __init__(self, *, ct="ButtonControl", name="保存", aid="aid-1", cls="Button",
+                 enabled=True, offscreen=False, focused=False, rect=(10, 20, 110, 60),
+                 rid=(12345, 678), value=None, text=None, rect_as_tuple=False):
+        self.ControlTypeName = ct
+        self.CachedControlType = getattr(B.auto.ControlType, ct, None)
+        self.Name = self.CachedName = name
+        self.AutomationId = self.CachedAutomationId = aid
+        self.ClassName = self.CachedClassName = cls
+        self.IsEnabled = self.CachedIsEnabled = enabled
+        self.IsOffscreen = self.CachedIsOffscreen = offscreen
+        self.HasKeyboardFocus = self.CachedHasKeyboardFocus = focused
+        self.BoundingRectangle = _FakeRect(*rect)
+        self.CachedBoundingRectangle = tuple(rect) if rect_as_tuple else _FakeRect(*rect)
+        self._rid = None if rid is None else list(rid)
+        self._value = _FakePattern(value=value) if value is not None else None
+        self._text = _FakePattern(text=text) if text is not None else None
+
+    def GetRuntimeId(self):
+        if self._rid is None:
+            raise RuntimeError("no runtime id")
+        return list(self._rid)
+
+    def GetCachedPropertyValue(self, pid):
+        if pid != B.auto.PropertyId.RuntimeIdProperty:
+            raise RuntimeError("unexpected cached property")
+        if self._rid is None:
+            raise RuntimeError("no cached runtime id")
+        return list(self._rid)
+
+    def GetValuePattern(self):
+        return self._value
+
+    def GetTextPattern(self):
+        return self._text
+
+    def GetCachedPattern(self, pattern_id):
+        if pattern_id == B.auto.PatternId.ValuePattern:
+            return self._value
+        if pattern_id == B.auto.PatternId.TextPattern:
+            return self._text
+        return None
+
+
+def t_com_init_unit() -> str:
+    """Bridge() must claim a COM apartment on the thread that constructs it.
+
+    Regression for the prefetch race: comtypes calls CoInitializeEx when *it* is
+    imported first (worker thread), so the main thread must claim its own
+    apartment or the first UIA call dies with WinError -2147221008.
+    """
+    import threading
+
+    state: dict = {}
+
+    def worker():
+        try:
+            Bridge()  # must CoInitializeEx on THIS thread
+            # S_FALSE(1) == the thread already had a COM apartment before the probe
+            state["hr"] = ctypes.windll.ole32.CoInitializeEx(None, 2)
+            ctypes.windll.ole32.CoUninitialize()
+        except Exception as exc:  # pragma: no cover - surface the real error
+            state["err"] = f"{type(exc).__name__}: {exc}"
+
+    t = threading.Thread(target=worker, name="com-init-probe", daemon=True)
+    t.start()
+    t.join(20)
+    assert not t.is_alive(), "COM 探针线程超时"
+    assert "err" not in state, state.get("err")
+    assert state.get("hr") == 1, (
+        f"Bridge() 未在构造线程声明 COM apartment（CoInitializeEx 返回 "
+        f"{state.get('hr')!r}，应为 S_FALSE=1）→ 首次 UIA 调用会报 WinError -2147221008")
+    return "工作线程构造 Bridge() 后 CoInitializeEx=S_FALSE（构造线程已持有 COM apartment）"
+
+
+def t_com_after_prefetch_import() -> str:
+    """Spawned-process regression: prefetch-thread import must not break main COM."""
+    code = (
+        "import sys, threading\n"
+        f"sys.path.insert(0, {str(SRC)!r})\n"
+        "import dpi, windows as W\n"
+        "done = threading.Event()\n"
+        "def prefetch():\n"
+        "    import bridge  # comtypes CoInitializeEx runs on THIS thread\n"
+        "    done.set()\n"
+        "threading.Thread(target=prefetch, daemon=True).start()\n"
+        "done.wait(20)\n"
+        "import bridge\n"
+        "b = bridge.Bridge()\n"
+        "snap = b.snapshot(W.foreground_hwnd(), view='controls', max_nodes=40)\n"
+        "print('OK total=%d shown=%d' % (snap['total'], snap['shown']))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120,
+        env=dict(os.environ, PYTHONUTF8="1"))
+    tail = ((proc.stdout or "") + (proc.stderr or ""))[-700:]
+    assert proc.returncode == 0, f"子进程 rc={proc.returncode}：{tail}"
+    assert "OK total=" in (proc.stdout or ""), f"快照没有成功：{tail}"
+    assert "CoInitialize" not in tail, f"出现 COM apartment 错误：{tail}"
+    return "子进程：工作线程先 import bridge → 主线程 Bridge()+snapshot 成功（无 -2147221008）"
+
+
+def t_cache_node_parity_unit() -> str:
+    """_make_node vs _make_node_cached on the same fake element: dicts must match."""
+    bridge = Bridge(use_cache=True)
+    mod = _FakeMod()
+    cases = [
+        ("ButtonControl", {}),
+        ("EditControl", {"value": "hello-cache"}),
+        ("EditControl", {"value": ""}),
+        ("ComboBoxControl", {"value": "combo"}),
+        ("DocumentControl", {"text": "document body 123"}),
+        ("PaneControl", {"name": ""}),
+        ("ButtonControl", {"rect_as_tuple": True}),
+        ("ButtonControl", {"rid": None}),           # "noid" fallback key
+        ("ButtonControl", {"rid": ("non-int", 7)}),  # 非常规 RuntimeId 也必须同 key
+        ("ButtonControl", {"rect": (0, 0, 0, 0), "offscreen": True, "name": ""}),  # dropped
+    ]
+    for ct, kw in cases:
+        kw = dict(kw)
+        name = kw.get("name", "保存")
+        fake = _FakeElement(ct=ct, **kw)
+        cand = (fake, 2, ("主面板",), ct, name, 3)
+        live_node, live_el = bridge._make_node(cand, with_doc_text=True)
+        cache_node, cache_el = bridge._make_node_cached(cand, mod=mod, with_doc_text=True)
+        assert live_node == cache_node, (
+            f"{ct} {kw}: node 不一致\n  live ={live_node}\n  cache={cache_node}")
+        if live_node is None:
+            assert live_el is None and cache_el is None, f"{ct}: 丢弃规则不一致"
+        else:
+            assert cache_el is not None and cache_el.cached_element is fake, "cache Element 必须持缓存元素"
+            assert cache_el.control is None, "cache 节点必须延迟 materialize（control=None）"
+            assert live_el.control is fake, "legacy Element 必须持 live control"
+    # RuntimeId -> id 稳定性：同一元素两次快照 id 相同
+    fake = _FakeElement()
+    cand = (fake, 0, (), "ButtonControl", "保存", 0)
+    n1, _e1 = bridge._make_node_cached(cand, mod=mod)
+    n2, _e2 = bridge._make_node_cached(cand, mod=mod)
+    assert n1["id"] == n2["id"], f"缓存路径 id 不稳定: {n1['id']} != {n2['id']}"
+    return (f"{len(cases)} 种元素（含值/文档文本/RECT 两种形态/noid 回退/零面积丢弃）"
+            f"逐字段一致，id 稳定")
+
+
+def t_cache_switch_unit() -> str:
+    """Env kill switch + per-Bridge override."""
+    old = os.environ.get("SUPER_CU_NO_CACHE")
+    try:
+        os.environ["SUPER_CU_NO_CACHE"] = "1"
+        assert Bridge()._use_cache is False, "SUPER_CU_NO_CACHE=1 必须关掉快路径"
+        assert Bridge(use_cache=True)._use_cache is True, "显式 use_cache 必须能覆盖环境变量"
+        for v in ("0", "false", "no", "off", ""):
+            os.environ["SUPER_CU_NO_CACHE"] = v
+            assert Bridge()._use_cache is True, f"{v!r} 不应关闭快路径"
+        assert Bridge(use_cache=False)._use_cache is False, "显式 use_cache=False 必须生效"
+    finally:
+        if old is None:
+            os.environ.pop("SUPER_CU_NO_CACHE", None)
+        else:
+            os.environ["SUPER_CU_NO_CACHE"] = old
+    return "SUPER_CU_NO_CACHE=1 关闭；0/false/no/off/空 保持开启；use_cache= 可覆盖"
+
+
+def t_cache_fallback_unit() -> str:
+    """Any cache exception raises (so snapshot falls back) and is logged once."""
+    bridge = Bridge(use_cache=True)
+
+    class _BoomClient:
+        def CreateCacheRequest(self):
+            raise RuntimeError("cache-boom")
+
+    class _Root:
+        Element = object()
+
+    orig = B._uia_ctx
+    buf = io.StringIO()
+    old = sys.stderr
+    B._uia_ctx = lambda: (_BoomClient(), _FakeMod())
+    try:
+        sys.stderr = buf
+        raised = None
+        try:
+            bridge._cached_cands(_Root(), hwnd=1, max_depth=24, view="controls",
+                                 name_filter=None, interactive_cap=0)
+        except Exception as exc:  # noqa: BLE001 - snapshot catches ANY exception
+            raised = exc
+        bridge._cache_fail(1, f"unit: {type(raised).__name__}")
+        log = buf.getvalue()
+    finally:
+        sys.stderr = old
+        B._uia_ctx = orig
+    assert raised is not None, "cache 异常必须冒泡给 snapshot（由它回退 legacy）"
+    assert "[supercu]" in log, f"回退必须写 stderr 日志: {log!r}"
+    assert not bridge._cache_usable(1), "失败窗口在 skip 窗口期内必须走 legacy"
+    assert bridge._cache_usable(2), "其他窗口不受影响"
+    return f"异常 {type(raised).__name__} → 冒泡；stderr 有 [supercu]；仅失败窗口暂停 cache"
+
+
+def t_memory_caps_unit() -> str:
+    """Bounded retention: id maps and window maps stay capped, newest ids resolve."""
+    bridge = Bridge()
+    bridge._max_ids = 8
+    ids = [bridge._id_for(("rid", i)) for i in range(50)]
+    assert len(bridge._rid2id) <= 8, f"_rid2id 未受限: {len(bridge._rid2id)}"
+    assert ids == sorted(ids) and len(set(ids)) == 50, "id 必须单调递增且绝不复用"
+    recent = ids[-8:]
+    controls = {
+        eid: B.Element(eid=eid, hwnd=1, rid=("rid", i), control=None,
+                       node={"id": eid, "ct": "button"}, ts=time.monotonic())
+        for i, eid in enumerate(recent)
+    }
+    bridge._remember_controls(controls)
+    assert len(bridge._id2el) <= 8, f"_id2el 未受限: {len(bridge._id2el)}"
+    assert bridge.by_id(recent[-1]) is not None, "最近返回的 id 必须可解析"
+    assert bridge.by_id(ids[0]) is None, "被淘汰的 id 应返回 None"
+    for junk in (None, "bad", -1, 10 ** 12):  # by_id 永不抛异常
+        assert bridge.by_id(junk) is None
+    # window-keyed maps
+    bridge._max_windows = 3
+    for h in range(10):
+        bridge._remember_window({"hwnd": h, "title": f"w{h}", "proc": "x", "pid": h})
+    assert len(bridge._win_info) <= 3, f"_win_info 未受限: {len(bridge._win_info)}"
+    assert 9 in bridge._win_info, "最近窗口必须保留"
+    bridge._win_ctl.update({h: object() for h in range(5)})
+    bridge._cache.update({h: {"nodes": []} for h in range(5)})
+    bridge._trim_windows()
+    assert len(bridge._win_ctl) <= 3 and len(bridge._cache) <= 3, (
+        len(bridge._win_ctl), len(bridge._cache))
+    return (f"id 上限 8：_rid2id={len(bridge._rid2id)} _id2el={len(bridge._id2el)}，"
+            f"最近 id 可解析；窗口上限 3：_win_info/_win_ctl/_cache 均受限，by_id 不抛异常")
+
+
+# ---- real-window parity helpers ------------------------------------------- #
+def _snap_pair(hwnd: int, *, view: str = "controls", max_nodes: int = 200):
+    """(legacy, cached) snapshots from two fresh Bridges (identical id spaces)."""
+    legacy = Bridge(use_cache=False)
+    cached = Bridge(use_cache=True)
+    sl = legacy.snapshot(hwnd, view=view, max_nodes=max_nodes)
+    sc = cached.snapshot(hwnd, view=view, max_nodes=max_nodes)
+    return sl, sc, legacy, cached
+
+
+def _node_diff(a: list[dict], b: list[dict]) -> str:
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            keys = [k for k in x if x.get(k) != y.get(k)]
+            detail = ", ".join(f"{k}: {x.get(k)!r} != {y.get(k)!r}" for k in keys)
+            return f"node[{i}] keys={keys}: {detail}"
+    if len(a) != len(b):
+        return f"节点数 {len(a)} != {len(b)}"
+    return ""
+
+
+def _assert_snap_equal(sl: dict, sc: dict, label: str) -> None:
+    assert sl["total"] == sc["total"], f"{label}: total {sl['total']} != {sc['total']}"
+    assert sl["shown"] == sc["shown"], f"{label}: shown {sl['shown']} != {sc['shown']}"
+    assert sl["truncated"] == sc["truncated"], f"{label}: truncated 不一致"
+    assert sl["nodes"] == sc["nodes"], f"{label}: 节点字典不一致 → {_node_diff(sl['nodes'], sc['nodes'])}"
+
+
+def t_cache_parity_notepad() -> str:
+    """Cached fast path must equal the legacy walk on Notepad, all views."""
+    hwnd = _NOTEPAD["hwnd"]
+    out = []
+    for view in ("controls", "text", "all"):
+        sl, sc, _lp, _cp = _snap_pair(hwnd, view=view, max_nodes=200)
+        _assert_snap_equal(sl, sc, f"notepad/{view}")
+        out.append(f"{view}(total={sl['total']}/shown={sl['shown']})")
+    # stable ids across two cached snapshots (RuntimeId -> id mapping)
+    cb = Bridge(use_cache=True)
+    s1 = cb.snapshot(hwnd, view="controls", max_nodes=200)
+    s2 = cb.snapshot(hwnd, view="controls", max_nodes=200)
+    a = {n["id"] for n in s1["nodes"]}
+    c = {n["id"] for n in s2["nodes"]}
+    assert a and a == c, f"cached 快照 id 复用 {len(a & c)}/{len(a)} != 100%"
+    STATS["cache_parity_notepad_total"] = float(s1["total"])
+    return "legacy==cached 逐字段一致 " + " ".join(out) + "；两次 cached 快照 id 复用 100%"
+
+
+def t_cache_parity_calc() -> str:
+    hwnd = _calc_hwnd()
+    if not hwnd:
+        return "SKIP: 计算器未启动"
+    sl, sc, _lp, _cp = _snap_pair(hwnd, view="controls", max_nodes=120)
+    _assert_snap_equal(sl, sc, "calculator/controls")
+    return f"计算器 controls total={sl['total']} shown={sl['shown']} 逐字段一致"
+
+
+def t_cache_parity_explorer() -> str:
+    """Read-only parity on an Explorer window (allowed app; static tree)."""
+    wins = [w for w in W.list_windows()
+            if (w["proc"] or "").lower() == "explorer" and w["visible"] and not w["minimized"]]
+    if not wins:
+        return "SKIP: 当前没有未最小化的资源管理器窗口"
+    wins.sort(key=lambda w: -((w["rect"][2] - w["rect"][0]) * (w["rect"][3] - w["rect"][1])))
+    hwnd = wins[0]["hwnd"]
+    sl, sc, _lp, _cp = _snap_pair(hwnd, view="controls", max_nodes=300)
+    _assert_snap_equal(sl, sc, "explorer/controls")
+    return f"#{hwnd} Explorer controls total={sl['total']} shown={sl['shown']} 逐字段一致（只读）"
+
+
+def t_cache_parity_large() -> str:
+    """Tolerant parity on the largest visible window (it may change between calls)."""
+    skip = {int(_NOTEPAD.get("hwnd") or 0), _calc_hwnd()}
+    cands = [w for w in W.list_windows()
+             if w["visible"] and not w["minimized"] and w["hwnd"] not in skip]
+    cands.sort(key=lambda w: -((w["rect"][2] - w["rect"][0]) * (w["rect"][3] - w["rect"][1])))
+    for w in cands[:5]:
+        if (w["rect"][2] - w["rect"][0]) < 600:
+            continue
+        try:
+            sl, sc, _lp, _cp = _snap_pair(w["hwnd"], view="controls", max_nodes=300)
+        except BridgeError:
+            continue
+        if sl["total"] < 60:
+            continue
+        a = {n["id"]: n for n in sl["nodes"]}
+        b = {n["id"]: n for n in sc["nodes"]}
+        union = set(a) | set(b)
+        overlap = len(set(a) & set(b)) / max(1, len(union))
+        assert abs(sl["total"] - sc["total"]) <= max(3, int(0.05 * sl["total"])), (
+            f"{w['proc']}: total {sl['total']} vs {sc['total']} 偏差过大")
+        assert overlap >= 0.90, f"{w['proc']}: id 重合率 {overlap:.0%} < 90%"
+        for nid in set(a) & set(b):
+            for key in ("ct", "aid", "cls", "enabled", "offscreen", "focused", "patterns", "depth"):
+                assert a[nid].get(key) == b[nid].get(key), (
+                    f"{w['proc']} id={nid} 字段 {key}: {a[nid].get(key)!r} != {b[nid].get(key)!r}")
+        STATS["cache_large_total"] = float(sl["total"])
+        return (f"#{w['hwnd']} {w['proc']} total={sl['total']}/{sc['total']} "
+                f"id 重合 {overlap:.0%} 共同节点字段一致（只读，容忍动态变化）")
+    return "SKIP: 没有可用的大型窗口（>=600px 且 total>=60）"
+
+
+def t_cache_fallback_live() -> str:
+    """Forced cache failure on a real window: identical output + [supercu] stderr."""
+    hwnd = _NOTEPAD["hwnd"]
+    ref = Bridge(use_cache=False).snapshot(hwnd, view="controls", max_nodes=120)
+    fast = Bridge(use_cache=True)
+
+    class _BoomClient:
+        def CreateCacheRequest(self):
+            raise RuntimeError("forced-cache-failure")
+
+    orig = B._uia_ctx
+    buf = io.StringIO()
+    old = sys.stderr
+    B._uia_ctx = lambda: (_BoomClient(), _FakeMod())
+    try:
+        sys.stderr = buf
+        got = fast.snapshot(hwnd, view="controls", max_nodes=120)
+        log = buf.getvalue()
+    finally:
+        sys.stderr = old
+        B._uia_ctx = orig
+    assert "[supercu]" in log, f"回退必须写 stderr: {log!r}"
+    assert got["nodes"] == ref["nodes"] and got["total"] == ref["total"], (
+        "回退结果必须与 legacy 完全一致 → " + _node_diff(ref["nodes"], got["nodes"]))
+    assert not fast._cache_usable(hwnd), "失败后该窗口应暂停 cache"
+    return (f"强制 cache 异常 → 透明回退 legacy，输出一致 total={ref['total']} shown={ref['shown']}，"
+            f"stderr 有 [supercu] 日志，窗口暂停 cache")
+
+
+def t_marks_live() -> str:
+    """screenshot(marks=) reads the snapshot cache; cached nodes have control=None."""
+    hwnd = _NOTEPAD["hwnd"]
+    b.snapshot(hwnd, view="controls", max_nodes=200)
+    shot = b.screenshot(hwnd, marks=True, marks_max=40)
+    marks = shot.get("marks") or []
+    assert marks, "screenshot(marks=True) 没有返回标注（_nodes_for_marks 路径断了）"
+    for mark in marks:
+        assert mark.get("id") and b.by_id(mark["id"]) is not None, (
+            f"mark id {mark.get('id')} 无法通过 by_id 解析")
+    assert shot.get("jpeg_bytes"), "标注截图无 JPEG 数据"
+    return f"marks={len(marks)} 个，id 全部可解析，JPEG {len(shot['jpeg_bytes'])}B（元素 control=None 不影响）"
+
+
 def cleanup() -> None:
     h = _calc_hwnd()
     if h and hwnd_alive(h):
@@ -1693,6 +2111,7 @@ def main() -> int:
     t0 = time.perf_counter()
     check("0.1 dpi/space", t_dpi)
     check("0.2 space three-way", t_space)
+    check("0.3 com init after prefetch import", t_com_after_prefetch_import)
     check("1. list_windows", t_list_windows)
 
     # 12. 非 GUI 单测先跑（不抢桌面）
@@ -1711,6 +2130,11 @@ def main() -> int:
     check("13.7 drag caption gate", t_drag_caption_gate)
     check("13.8 drag edge clamp", t_drag_edge_clamp)
     check("13.9 drag path axes/route", t_drag_path_axis)
+    check("14.0 com init on constructing thread", t_com_init_unit)
+    check("14.1 cache node parity (unit)", t_cache_node_parity_unit)
+    check("14.2 cache switch (unit)", t_cache_switch_unit)
+    check("14.3 cache fallback (unit)", t_cache_fallback_unit)
+    check("14.4 memory caps (unit)", t_memory_caps_unit)
     if "--unit-only" in sys.argv[1:]:
         # 纯单测模式：不碰桌面、不写剪贴板（Lead 正在用机器时用这个）
         passed = sum(1 for r in RESULTS if r[1])
@@ -1727,6 +2151,7 @@ def main() -> int:
 
     # 11. UWP 计算器：launch 严格定位 + 树重建语义重定位（P0-1 / P0-2）
     if check("11.0 uwp launch", t_uwp_launch):
+        check("11.0b cache parity (calculator)", t_cache_parity_calc)
         check("11.1 uwp pattern click", t_uwp_click)
         check("11.2 uwp semantic relocate", t_uwp_relocate)
         check("11.3 uwp close", t_uwp_close)
@@ -1741,6 +2166,8 @@ def main() -> int:
         _notepad_ok = True
         print(f"      notepad hwnd=#{_NOTEPAD['hwnd']} pid={_NOTEPAD['pid']}")
         check("2.1 snapshot controls", t_snapshot)
+        check("2.1b cache parity (notepad)", t_cache_parity_notepad)
+        check("2.1c cache fallback (notepad)", t_cache_fallback_live)
         check("2.2 snapshot text view", t_snapshot_text_view)
         check("3. act setvalue", t_setvalue)
         check("3.1 act paste", t_paste_document)
@@ -1751,8 +2178,11 @@ def main() -> int:
         check("5. gui_locked coverage", t_lock_wrapped)
         check("6. ambiguity refusal", t_class_ambiguous)
         check("7. screenshot", t_screenshot)
+        check("7.1 screenshot marks (cached nodes)", t_marks_live)
         check("8. wait", t_wait)
         check("9. edge snapshot(read)", t_edge_snapshot)
+        check("9.0b cache parity (explorer)", t_cache_parity_explorer)
+        check("9.0c cache parity (large real)", t_cache_parity_large)
         check("9.1 heavy window perf", t_heavy_perf)
         check("10. act close", t_close)
 

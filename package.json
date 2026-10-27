@@ -1,6 +1,6 @@
 {
   "name": "dsh-super-cu",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "DSH bundle for Windows desktop control over UI Automation: compact semantic snapshots with stable element ids (cu_show) and batched mouse, keyboard, window and wait/assert actions (cu_do).",
@@ -29,7 +29,14 @@
     "setup.ps1",
     "CHANGELOG.md",
     "docs/RESEARCH.md",
-    "tests/test_server.py"
+    "docs/OPTIMIZATION.md",
+    "docs/OPT-BASELINE.md",
+    "docs/OPT-AFTER.md",
+    "docs/OPT-VERIFY.md",
+    "tests/test_server.py",
+    "tests/test_bridge.py",
+    "bench/opt/bench.py",
+    "bench/verify/verify.py"
   ],
   "dsh": {
     "bundle": {

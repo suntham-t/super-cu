@@ -7,13 +7,14 @@
 > `cu_do` (act) — built on UI Automation with **stable element ids**, **pattern-first actions**,
 > **batched steps** and a **visual fallback**. No dependency on screenshots for the normal path.
 
-|  | 实测（同机对比 `windows-mcp` 4.0.3） |
+|  | 实测（同机对比 `windows-mcp` 4.0.3；1.2.0 为成对交织 A/B） |
 |---|---|
-| 观察延迟 p50 / p95 | **231 / 255 ms** vs 1059 / 1229 ms → **快 4.57×** |
-| 文本体积（Edge 15 标签页） | **3 308 字符** vs 31 261 → **小 9.45×**（~1305 vs ~9472 tokens） |
+| 观察延迟 p50（controls，max_nodes=300） | **28 ms**（大 Chromium）/ **92 ms**（Notepad）/ **129 ms**（Explorer） vs 1059 ms → **快 8-38×** |
+| 文本体积（Edge 15 标签页） | **3 308 字符** vs 31 261 → **小 9.45×**（~1305 vs ~9472 tokens；1.2.0 与 1.1.2 逐字节相同） |
 | 元素级稳定 id | **跨快照 100% 复用**（旧方案只有坐标） |
 | 交互元素召回率 | **100%（93/93）** |
-| 冷启动到 tools/list | **745 ms** vs 6 993 ms |
+| 冷启动到 tools/list | **~256 ms** vs 6 993 ms（1.1.2 是 745 ms，-70.8%） |
+| 长会话内存 | **id 表 20000 / 窗口缓存 32** 上限（LRU，id 不复用） |
 | 工具数 | **2 个** vs 20 个 |
 
 ---
@@ -21,11 +22,13 @@
 ## 为什么快
 
 1. **窗口列表走 win32 `EnumWindows`（~5 ms）**，UIA 只进目标窗口（旧方案每次枚举整桌面 UIA ≈420 ms/次）。
-2. **单窗口 DFS + 叶子剪枝 + 属性延迟读取**：Edge 428 节点 walk 123 ms + 属性 65 ms。
-3. **默认纯文本，不截图**：截图要多一次抓屏+压缩（~90 ms）和上千 token。
-4. **有界 DFS 早停**：controls 视图最终只展示前 `max_nodes` 个交互元素，收集满即停 ——
-   重窗口（436 节点、truncated）p50 **265 → 135 ms（-49%）**，输出逐字节相同、召回 100%。
-5. **批量动作**：一次 `cu_do` 完成多步（含等待与断言），把 N 个来回压成 1 个。
+2. **单窗口一次 `BuildUpdatedCache` 取回整棵 raw 子树与属性（1.2.0）**：属性读取在本进程完成，
+   大窗口快 8.6×、Notepad 1.7×；任何异常自动回退逐节点 walk，`SUPER_CU_NO_CACHE=1` 可强制回退。
+3. **握手后才懒加载/预热重模块（1.2.0）**：`initialize`/`tools/list` 不导入 uiautomation/Pillow，
+   冷启动 256 ms；预热用原始线程，不阻塞协议循环。
+4. **默认纯文本，不截图**：截图要多一次抓屏+压缩（~90 ms）和上千 token。
+5. **有界 DFS 早停**：controls 视图最终只展示前 `max_nodes` 个交互元素，收集满即停；输出逐字节相同、召回 100%。
+6. **批量动作**：一次 `cu_do` 完成多步（含等待与断言），把 N 个来回压成 1 个。
 
 ## 为什么准
 
@@ -43,7 +46,7 @@
 
 ## 工具
 
-### `cu_show` — 观察（默认纯文本，~50–300 ms）
+### `cu_show` — 观察（默认纯文本，~25–130 ms；1.2.0 缓存快路径）
 
 ```
 win #39719780 "无标题 - 画图" 2030x1271 @264,159 [focus]
@@ -97,6 +100,21 @@ op 一览：
 - 依据见 [`docs/RESEARCH.md`](docs/RESEARCH.md)：对比 Windows-MCP / OmniParser / computer-use 规范后，
   采纳了 5 条"不引入视觉模型、不扩权限面"的交互原语，并明确拒绝了 5 条（会拖慢或越权的）。
 
+### 1.2 新增（性能轮，默认行为不变）
+
+- **UIA 缓存请求快路径**：一次 `BuildUpdatedCache` 取回整棵子树，大 Chromium 窗口快 **8.6×**、
+  Explorer -39.5%、Notepad -44.5%；任何异常自动回退逐节点 walk（`SUPER_CU_NO_CACHE=1` 强制回退）。
+- **冷启动 3.4×**：745 → **~256 ms**（spawn→initialize，-70.8%）；握手后原始线程预热模块，
+  `tools/list`→首次 `cu_show` 从 480 ms 降到 **12 ms**（客户端有空闲时）。
+- **长会话内存有界**：元素 id 表 20000、窗口缓存 32，LRU 淘汰、id 不复用；
+  8 万个不同 id 的合成压测 RSS +12.4 MB（旧版 +45 MB）。
+- **cu_do settle**：只有 set/focus 的同步 UIA 中间步骤可在探针确认后提前结束等待；
+  真实 5 步 Notepad 批处理 **1230 → 1036 ms**（-15.8%）。
+- **修复**：预热线程抢走 `CoInitializeEx` 导致首次真实 `cu_show` 报「尚未调用 CoInitialize」的竞态
+  （单元 + 真实进程回归测试）。文本格式、工具 schema、快照契约均未变。
+- 细节/证据/复现：`docs/OPTIMIZATION.md`、`docs/OPT-AFTER.md`、`docs/OPT-VERIFY.md`；
+  环境开关 `SUPER_CU_NO_CACHE` / `SUPER_CU_NO_PREFETCH` / `SUPER_CU_SETTLE_MIN_MS`。
+
 ## 安装
 
 **要求**：Windows 10/11、Python 3.11+、DSH `>= 0.2`。
@@ -136,8 +154,11 @@ src/dpi.py             DPI 三空间合一
 src/gui_lock.py        多智能体共享桌面的互斥锁
 src/mock_bridge.py     离线 mock（协议层测试用）
 tests/                 单测 + 真机集成测试（GUI 部分）
+bench/opt/             可复现基准（baseline / after / 成对 A/B / fixtures）
+bench/verify/          独立验收（parity / golden / 协议 / 性能门禁）
 SKILL.md               给智能体的操作手册
 docs/CONTRACT.md       完整接口契约（实现细节）
+docs/OPT-*.md          1.2.0 优化报告 / 基线 / 对照 / 验收
 docs/images/           真实任务截图
 ```
 
@@ -149,8 +170,10 @@ docs/images/           真实任务截图
 - **端到端**：记事本输入并保存到磁盘（内容逐字比对）、计算器 7×8=56、PowerPoint 6 页 PPT 并发送到微信
   （无 API 客户端）、微信发消息、画图里画笑脸、Blender 建一棵树、**在真实 Minecraft 里用 `/fill`
   盖了一栋 7×7 带门/窗/屋顶的房子**。
-- **回归**：`tests/test_bridge.py` 29 项（含剪贴板、拖拽、UWP 重定位、修饰键、hold）+
-  `tests/test_server.py` 141 项 mock 协议测试。
+- **回归（1.2.0）**：`tests/test_bridge.py` 真实 55 项（缓存 parity/回退/marks/内存上限/动作）+
+  `--unit-only` 24 项；`tests/test_server.py` 197 项 mock 协议测试；独立验收见 `docs/OPT-VERIFY.md`。
+- **性能（1.2.0）**：成对交织 A/B 前后对比（冷启动/快照/渲染/截图/端到端/内存）见 `docs/OPT-AFTER.md`；
+  基准可复现：`python bench/opt/bench.py --help`。
 
 | | |
 |---|---|
@@ -163,8 +186,9 @@ docs/images/           真实任务截图
 - **Chromium 的 `view=text`** 取不到正文（TextPattern 为空）→ 用 `controls`（TextControl 的 name 就是文本）。
 - **控制台窗口**（conhost）UIA 只有十几个节点、读不到输出文本 → 退路：截图或用非 UI 手段。
 - **UIPI**：管理员权限窗口可能拒绝输入/读取。
-- **标题栏拖动的水平位移**：cu_do 路径目前会丢 x（bridge 直连正常，server 侧待修；
-  复现与数据见 ench/regress-report.md）。内容拖动、drag.to=#id 不受影响。
+- **标题栏拖动**：目标窗口内部有模态对话框/弹窗时（例如记事本恢复旧标签弹出的「找不到文件」），
+  标题栏拖动不会移动窗口（直连 bridge 也一样，属于窗口状态而非插件缺陷）；先处理弹窗再拖。
+  正常窗口的标题栏拖动、内容拖动、drag.to=#id 均不受影响。
 - **指针锁定 + raw input 的游戏**（如 Minecraft）：`SetCursorPos` 无法转视角；要用游戏内命令或键位。
 - **Office 现代「保存此文件」对话框**不接受全路径 → 先「更多选项…」→「浏览」进经典对话框。
 - 一次 `cu_do` 建议 ≤10 步（批量期间持有 GUI 锁，其它智能体会等待）。
@@ -179,8 +203,9 @@ MIT © 2026 suntham-t
 
 `dsh-super-cu` is a DeepSeek Harness bundle that gives an agent two tools — `cu_show` (a compact,
 token-cheap accessibility snapshot of one window with **stable element ids**) and `cu_do` (a batched
-action runner with waits/assertions). Compared with screenshot-based computer use it is **4.6× faster**,
-returns **9.5× less text** and reuses element ids across snapshots (100%). Accuracy comes from
+action runner with waits/assertions). Compared with screenshot-based computer use it is **8-38× faster** on snapshots
+(28 ms for a large Chromium window) and returns **9.5× less text**; cold start is **~256 ms**.
+Element ids are reused across snapshots (100%). Accuracy comes from
 UI-Automation patterns, refusing ambiguous targets, DPI-space unification, normalized fallback
 coordinates and loud failures. Works on Windows 10/11 with Python 3.11+; install with `setup.ps1`
 then add the folder in DSH's plugin manager.

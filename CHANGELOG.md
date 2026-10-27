@@ -1,5 +1,58 @@
 # Changelog
 
+## 1.2.0 — 2026-10-27
+
+Performance round: snapshot fast path over UIA cache requests, lazy startup with after-handshake
+prefetch, bounded long-session memory. **No tool schema, text format or snapshot-contract change**
+(`compact.py` and `windows.py` are byte-identical to 1.1.2).
+
+### Performance (paired interleaved A/B vs 1.1.2, same machine, see `docs/OPT-AFTER.md`)
+
+- **`cu_show` snapshot**: one `BuildUpdatedCache(RawViewCondition, Subtree)` call per window instead of
+  ~9 cross-process property reads per node plus RawViewWalker child calls; cached properties are read
+  locally. Large Chromium window 218.4 -> 28.3 ms (-86.3%, 8.6x at `max_nodes=400`); Explorer System32
+  217.8 -> 129.0 ms (-39.5%); Notepad 169.2 -> 91.8 ms (-44.5%). Same visited/shown counts.
+- **Cold start**: `initialize`/`tools/list` no longer import uiautomation/Pillow. spawn->initialize
+  859.7 -> 255.8 ms p50 (-70.8%; -95.4% after subtracting the interpreter floor). A raw thread prefetches
+  the modules after the handshake without blocking the protocol loop: `tools/list`->first `cu_show`
+  480.2 -> 12.2 ms when the client pauses at all.
+- **Warm end-to-end** `cu_show`: 144.6 -> 94.6 ms (-40.6%). Render output unchanged (30,313 chars /
+  11,659 tokens_est on the 11 fixture-view pairs, byte-identical).
+- **Memory**: element-id map capped at 20,000 (LRU, ids never reused) and window caches at 32.
+  Synthetic 80,000-id churn: +45.0 MB -> +12.4 MB RSS, newest ids still resolve.
+- **cu_do**: `settle_ms` stays an upper bound; only set/focus steps that changed the UI through a
+  synchronous UIA pattern (and are not last / carry no expect) may end the wait early after two cheap
+  win32 probes. Real 5-step Notepad batch: 1230.2 -> 1035.6 ms p50 (-15.8%). Input-synthesis batches
+  unchanged.
+
+### Fixed
+
+- **COM apartment race with the import prefetch**: comtypes calls `CoInitializeEx` in whichever thread
+  imports it first; when the prefetch finished before the first tool call, the first real `cu_show`
+  failed with `OSError: [WinError -2147221008] 尚未调用 CoInitialize`. `Bridge.__init__` now claims a COM
+  apartment on the requesting thread before any UIA object; covered by a unit test and a spawned-process
+  regression test.
+- `by_id()` miss message now mentions id recycling after very long sessions.
+
+### Added
+
+- `SUPER_CU_NO_CACHE=1` (force the 1.1.2 per-node walk), `SUPER_CU_NO_PREFETCH=1` (disable module
+  prefetch), `SUPER_CU_SETTLE_MIN_MS` (force blind settle floor). All are escape hatches; defaults
+  enable the new fast paths.
+- `bench/opt/bench.py` (reproducible harness: cold start / snapshot / render / screenshot / e2e /
+  memory + interleaved paired A/B + frozen fixtures) and `bench/verify/` (independent parity,
+  golden, protocol and performance gates).
+- `docs/OPTIMIZATION.md` (this round), `docs/OPT-BASELINE.md` (1.1.2 baseline),
+  `docs/OPT-AFTER.md` (paired A/B), `docs/OPT-VERIFY.md` (independent sign-off).
+
+### Safety
+
+- Every cache/COM error logs once to stderr and falls back to the legacy walk; a window whose cache
+  build exceeds the 250 ms budget or keeps failing is served by the legacy path for 60 s; output is
+  always identical.
+- Tests: real bridge suite 55/55 PASS, mock protocol suite 197/197 PASS, bridge unit suite 24/24,
+  py_compile clean.
+
 ## 1.1.2 — 2026-10-24
 
 ### Changed
